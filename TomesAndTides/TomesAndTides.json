@@ -1,0 +1,9 @@
+{
+  "Author": "baanderson40",
+  "Name": "Tomes & Tides",
+  "InternalName": "TomesAndTides",
+  "Punchline": "Debug weekly tomestone data and dungeon rewards.",
+  "Description": "Read-only debug tools for current capped tomestones, dungeon rewards, and AutoDuty path availability. Open with /tomestides or /tt. No automation is started.",
+  "ApplicableVersion": "any",
+  "Tags": ["tomestones", "debug", "utility"]
+}
