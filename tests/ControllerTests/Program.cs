@@ -17,6 +17,9 @@ var tests = new (string Name, Action Run)[]
     ("near-complete wait services venture when it becomes ready", TestVentureBecomesReady),
     ("venture beyond wait window permits continuation without an AR pass", TestVentureOutsideWait),
     ("disabled service clears checkpoint without requesting AutoRetainer", TestServiceDisabled),
+    ("reload resume restores parent session and captured fishing settings", TestReloadResumesParentSession),
+    ("failed coordinated resume restores recovery state", TestReloadResumePersistenceFailure),
+    ("ambiguous fishing recovery blocks farming resume", TestAmbiguousFishingBlocksResume),
 };
 
 var failed = 0;
@@ -255,11 +258,68 @@ static void TestVentureBecomesReady()
 static void TestServiceDisabled()
 {
     var h = new Harness(known: true, ready: true);
-    h.Configuration.MonitorRetainerVentures = false;
+    h.Configuration.AutomationSession!.ServiceRetainers = false;
     h.TickAll();
     Equal(0, h.Retainers.PassRequests, "disabled setting prevents AutoRetainer request");
     Equal(null, h.Configuration.FarmingPlan!.RetainerCheckpointOperationId, "disabled service clears checkpoint");
     Equal(0, h.AutoDuty.RunRequests, "dungeon is queued only on subsequent tick");
+}
+
+static void TestReloadResumesParentSession()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    h.Configuration.AutomationSession!.OceanFishingEnabled = true;
+    h.Configuration.AutomationSession.OceanFishingPreparationLeadMinutes = 27;
+    h.Configuration.AutomationSession.OceanFishingCharacterMode = "SelectedCharacter";
+    h.Configuration.AutomationSession.OceanFishingCharacterContentId = 456;
+    h.Configuration.AutomationSession.OceanFishingCharacterName = "Fishing Alt";
+    h.Configuration.AutomationSession.OceanFishingCharacterWorld = "Test World";
+    h.Configuration.HandledOceanFishingWindowsUtc = [new DateTimeOffset(2026, 10, 21, 8, 0, 0, TimeSpan.Zero)];
+    h.Automation.RecoverAfterReload();
+    h.Farming.RecoverAfterReload();
+    h.Handoff.RecoverAfterReload();
+    h.Handoff.RefreshResumeReadiness();
+
+    True(h.Farming.CanResumeAfterReload, "plan and parent session are resumable after reload");
+    True(h.Handoff.CanResumeAutomationSession, "safe farming character and idle providers permit resume");
+    True(h.Farming.ResumeAfterReload(h.Handoff.CanResumeAutomationSession), "coordinated resume persists");
+    Equal("Active", h.Configuration.AutomationSession!.State, "parent session resumed");
+    Equal("Active", h.Configuration.FarmingPlan!.State, "weekly plan resumed");
+    Equal(27, h.Configuration.AutomationSession.OceanFishingPreparationLeadMinutes, "captured lead preserved");
+    Equal("Fishing Alt", h.Configuration.AutomationSession.OceanFishingCharacterName, "selected fishing character preserved");
+    Equal(1, h.Configuration.HandledOceanFishingWindowsUtc.Count, "handled window ledger preserved");
+    Equal(0, h.Retainers.PassRequests, "resume does not replay retainer request");
+}
+
+static void TestReloadResumePersistenceFailure()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false) { FailResumeSave = true };
+    h.Automation.RecoverAfterReload();
+    h.Farming.RecoverAfterReload();
+    h.Handoff.RecoverAfterReload();
+    h.Handoff.RefreshResumeReadiness();
+
+    True(!h.Farming.ResumeAfterReload(h.Handoff.CanResumeAutomationSession), "failed coordinated save reports failure");
+    Equal("RecoveryRequired", h.Configuration.AutomationSession!.State, "parent remains blocked after save failure");
+    Equal("RecoveryRequired", h.Configuration.RetainerSession!.State, "retainer remains blocked after save failure");
+    Equal("RecoveryRequired", h.Configuration.FarmingPlan!.State, "plan remains blocked after save failure");
+}
+
+static void TestAmbiguousFishingBlocksResume()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    h.Configuration.OceanFishingOperation = new OceanFishingOperationRecord
+    {
+        OperationId = "ocean-op", SessionId = "session", State = "RecoveryRequired",
+        WindowStartUtc = h.Clock.UtcNow, LaunchIntentUtc = h.Clock.UtcNow,
+    };
+    h.Automation.RecoverAfterReload();
+    h.Farming.RecoverAfterReload();
+    h.Handoff.RecoverAfterReload();
+    h.Handoff.RefreshResumeReadiness();
+
+    True(!h.Farming.CanResumeAfterReload, "ambiguous fishing ownership blocks farming resume");
+    Equal(0, h.Retainers.PassRequests, "blocked recovery does not replay retainer work");
 }
 
 static void TestVentureOutsideWait()
@@ -317,7 +377,9 @@ sealed class Harness
     public readonly DungeonRunController Dungeon;
     public readonly FarmingPlanController Farming;
     public readonly RetainerHandoffController Handoff;
+    public readonly AutomationSessionController Automation;
     public bool FailCheckpointClearSave { get; set; }
+    public bool FailResumeSave { get; set; }
     public int WeeklyAcquired { get; set; } = 100;
     public string EligibilityStatus { get; set; } = "Eligible";
     public int EligibilityChecks { get; private set; }
@@ -330,8 +392,12 @@ sealed class Harness
         Retainers = new FakeRetainers { Known = known, Ready = ready, Clock = Clock };
         Lifestream = new FakeLifestream(Game);
         var log = new NullWorkflowLog();
+        Automation = new AutomationSessionController(Configuration, Save, log, Clock);
         void Save()
         {
+            if (FailResumeSave && Configuration.AutomationSession is { State: "Active" } &&
+                Configuration.FarmingPlan is { State: "Active" })
+                throw new IOException("Injected coordinated resume persistence failure.");
             if (FailCheckpointClearSave && !failedCheckpointSave &&
                 Configuration.RetainerHandoff is { State: "Completed" } &&
                 Configuration.FarmingPlan is { RetainerCheckpointOperationId: null })
@@ -344,7 +410,7 @@ sealed class Harness
         Dungeon = new DungeonRunController(Configuration, Save, AutoDuty, Retainers, Game, log,
             CheckEligibility,
             () => new DebugTests.LiveTomeState(123, 49, WeeklyAcquired, 900, 100));
-        Farming = new FarmingPlanController(Configuration, Save, Dungeon, Game, log,
+        Farming = new FarmingPlanController(Configuration, Save, Dungeon, Game, Automation, log,
             () => new DebugTests.LiveTomeState(123, 49, WeeklyAcquired, 900, 100),
             CheckEligibility,
             territory => new DebugTests.DungeonOption(territory, 456, 789, "Test Dungeon", 50, 1, 1, true, true),
@@ -361,6 +427,7 @@ sealed class Harness
             Configuration.FarmingPlan = new FarmingPlanRecord
             {
                 PlanId = "plan", State = "Active", CharacterContentId = 123, TerritoryId = 321,
+                FarmingCharacterName = Game.Name, FarmingCharacterWorld = Game.World,
                 ContentFinderConditionId = 456, DungeonName = "Test Dungeon", Mode = "Support",
                 GearsetInspectionId = 0, BareMode = true, ServiceRetainers = true, DungeonReward = 50,
                 CurrencyItemId = 49, WeeklyLimitAtStart = 900, WeeklyResetUtc = week.AddDays(7),
@@ -383,6 +450,13 @@ sealed class Harness
                 SessionId = "session", FarmingPlanId = "plan", State = "Active", ServiceRetainers = true,
                 FarmingCharacterContentId = 123, FarmingCharacterName = Game.Name, FarmingCharacterWorld = Game.World,
                 ExpiresUtc = week.AddDays(7),
+            };
+            Configuration.AutomationSession = new AutomationSessionRecord
+            {
+                SessionId = "session", State = "Active", FarmingPlanId = "plan",
+                FarmingCharacterContentId = 123, FarmingCharacterName = Game.Name, FarmingCharacterWorld = Game.World,
+                ServiceRetainers = true, RetainerWaitBeforeDungeonMinutes = 5,
+                CreatedUtc = Clock.UtcNow, OceanFishingCharacterMode = "CurrentCharacter",
             };
             if (seedCompletedRun)
                 Dungeon.Tick(); // mirrors the prior production tick that published CanAcknowledge for the verified run.
@@ -473,6 +547,11 @@ sealed class FakeRetainers : IRetainerProvider
     public RetainerReadinessSnapshot ReadReadiness(ulong currentCharacterContentId = 0) =>
         new(Known, Ready, 4, Ready ? 1 : 0, ClosestEligibleSeconds, Busy, Active, Clock.UtcNow,
             Known ? null : "test unknown readiness", "ready-fingerprint");
+    public bool TryGetRegisteredCharacters(out IReadOnlyList<RetainerCharacterIdentity> characters)
+    {
+        characters = [new RetainerCharacterIdentity(123, "Farm Main", "Test World")];
+        return Known;
+    }
     public void RequestSingleRetainerPass()
     {
         PassRequests++;

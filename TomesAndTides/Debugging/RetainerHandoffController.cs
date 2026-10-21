@@ -33,6 +33,7 @@ public sealed class RetainerHandoffController(
     private bool? providerBusy;
     private bool? providerActive;
     private bool? lifestreamBusy;
+    public bool CanResumeAutomationSession { get; private set; }
     private IUtcClock Clock { get; } = clock ?? SystemUtcClock.Instance;
 
     public RetainerAutomationSessionRecord? Session => configuration.RetainerSession;
@@ -43,6 +44,18 @@ public sealed class RetainerHandoffController(
     public event Action? StateChanged;
 
     public void Subscribe() => autoRetainer.SinglePassFinished += OnSinglePassFinished;
+
+    /// <summary>Refreshes cached recovery preflight on the framework thread; never called from ImGui drawing.</summary>
+    public void RefreshResumeReadiness()
+    {
+        CanResumeAutomationSession = false;
+        if (configuration.AutomationSession is not { State: "RecoveryRequired", RecoveryKind: "Reload" } ||
+            Handoff is { State: not ("Completed" or "RecoveryAcknowledged") } ||
+            !IsFarmingCharacterCurrent() || !IsSafePlayerState() || !TryPollProviders() ||
+            providerBusy != false || providerActive != false || lifestreamBusy != false || readAutoDutyStopped() != true)
+            return;
+        CanResumeAutomationSession = true;
+    }
 
     public void Dispose() => autoRetainer.SinglePassFinished -= OnSinglePassFinished;
 
@@ -87,10 +100,14 @@ public sealed class RetainerHandoffController(
 
     public void RequestStop()
     {
+        var parent = configuration.AutomationSession;
         var session = Session;
-        if (session is not { State: "Active" })
+        if (parent is not { State: "Active" } || session is null)
             return;
         farmingPlan.RequestStop(preserveOwnedRetainerCheckpoint: OwnsActivity);
+        parent.State = "StopRequested";
+        parent.StopRequested = true;
+        parent.Detail = "Manual Stop requested; no new work will be admitted while owned cleanup settles.";
         if (OwnsActivity)
         {
             session.StopRequested = true;
@@ -126,6 +143,13 @@ public sealed class RetainerHandoffController(
             session.StopRequested = true;
             session.Detail = "Recovery acknowledged and retainer session stopped. Start a new session explicitly to resume.";
         }
+        if (configuration.AutomationSession is { } parent)
+        {
+            parent.State = "Stopped";
+            parent.StopRequested = true;
+            parent.Detail = "Recovery acknowledged and automation session stopped; no ambiguous request was replayed.";
+            parent.RecoveryKind = null;
+        }
         farmingPlan.RequestStop();
         if (!SaveOrBlock("acknowledge retainer recovery"))
             return false;
@@ -134,11 +158,11 @@ public sealed class RetainerHandoffController(
         return true;
     }
 
-    public void Tick()
+    public void Tick(bool allowNewWork = true)
     {
         try
         {
-            TickCore();
+            TickCore(allowNewWork);
         }
         catch (Exception error)
         {
@@ -146,18 +170,21 @@ public sealed class RetainerHandoffController(
         }
     }
 
-    private void TickCore()
+    private void TickCore(bool allowNewWork)
     {
         var session = Session;
+        var parent = configuration.AutomationSession;
         var plan = farmingPlan.Current;
-        if (session is null || plan is null || session.FarmingPlanId != plan.PlanId ||
-            session.State is not ("Active" or "StopRequested"))
+        if (session is null || parent is null || session.SessionId != parent.SessionId ||
+            parent.State is not ("Active" or "StopRequested"))
+            return;
+        if (plan is not null && session.FarmingPlanId != parent.SessionId && session.FarmingPlanId != plan.PlanId)
             return;
         if (OwnsActivity)
         {
             if (Handoff is not { } ownedHandoff ||
                 !RetainerHandoffPolicy.HandoffMatchesCheckpoint(ownedHandoff.SessionId, session.SessionId,
-                    ownedHandoff.FarmingOperationId, plan.RetainerCheckpointOperationId))
+                    ownedHandoff.FarmingOperationId, plan?.RetainerCheckpointOperationId))
             {
                 RequireRecovery("Owned retainer handoff does not match the active plan/session checkpoint; continuation is blocked.");
                 return;
@@ -165,27 +192,26 @@ public sealed class RetainerHandoffController(
             TickHandoff(session, Handoff!);
             return;
         }
-        if (session.StopRequested)
+        if (session.StopRequested || parent.StopRequested || parent.State == "StopRequested")
         {
             SetSessionState(session, "Stopped", "Stop completed at safe boundary; no new retainer pass will be started.");
             return;
         }
-        if (plan.StopRequested || plan.State is "PendingValidation" or "RecoveryRequired" or "Stopped" or "Expired")
+        if (parent.State != "Active" || plan?.State is "PendingValidation" or "RecoveryRequired")
             return;
         var now = Clock.UtcNow;
-        if (now >= session.ExpiresUtc)
-        {
-            SetSessionState(session, "Expired", "Weekly reset reached; no new retainer passes will start until a new explicit session.");
-            return;
-        }
-        var checkpointOperationId = plan.RetainerCheckpointOperationId;
+        var checkpointOperationId = plan?.RetainerCheckpointOperationId;
         var checkpointPending = checkpointOperationId is not null;
-        if (!checkpointPending && !farmingPlan.AllowsRetainerHandoffNow)
+        if (checkpointPending && plan is null)
             return;
-        var serviceEnabled = plan.ServiceRetainers && configuration.MonitorRetainerVentures;
+        if (!allowNewWork && !checkpointPending)
+            return;
+        if (!checkpointPending && !farmingPlan.AllowsRetainerHandoffNow && !(allowNewWork && plan is null))
+            return;
+        var serviceEnabled = parent.ServiceRetainers;
         if (checkpointPending && !serviceEnabled)
         {
-            CompleteCheckpoint(plan, checkpointOperationId!, "Retainer checkpoint skipped because venture service is disabled; farming may continue.");
+            CompleteCheckpoint(plan!, checkpointOperationId!, "Retainer checkpoint skipped because venture service is disabled; farming may continue.");
             return;
         }
         var readiness = readReadiness();
@@ -202,19 +228,19 @@ public sealed class RetainerHandoffController(
         if (checkpointPending && serviceEnabled && readiness is { Known: true, Ready: false })
         {
             if (RetainerHandoffPolicy.ShouldWaitForNearCompleteVenture(readiness.Known, readiness.Ready,
-                    readiness.ClosestEligibleSeconds, plan.RetainerWaitBeforeDungeonMinutes))
+                    readiness.ClosestEligibleSeconds, plan?.RetainerWaitBeforeDungeonMinutes ?? parent.RetainerWaitBeforeDungeonMinutes))
                 return;
             if (!TryPollProviders() || providerBusy != false || providerActive != false || lifestreamBusy != false ||
                 readAutoDutyStopped() != true)
                 return;
-            CompleteCheckpoint(plan, checkpointOperationId!, "Retainer checkpoint complete; no ready venture is within the configured wait window.");
+            CompleteCheckpoint(plan!, checkpointOperationId!, "Retainer checkpoint complete; no ready venture is within the configured wait window.");
             return;
         }
         var readinessFresh = readiness is not null && now - readiness.CapturedUtc <= ReadinessFreshness;
         var cooldownElapsed = session.LastPassUtc is not { } lastPass || now - lastPass >= PassCooldown;
         if (!RetainerHandoffPolicy.MayRequestPass(
                 session.State == "Active", session.StopRequested, serviceEnabled,
-                now < session.ExpiresUtc, checkpointPending || farmingPlan.AllowsRetainerHandoffNow,
+                true, checkpointPending || farmingPlan.AllowsRetainerHandoffNow,
                 dungeonRun.Current is not null, OwnsActivity,
                 readiness?.Known == true, readiness?.Ready == true, readinessFresh, cooldownElapsed))
             return;
@@ -239,10 +265,11 @@ public sealed class RetainerHandoffController(
     {
         readiness = refreshReadiness();
         var plan = farmingPlan.Current;
-        if (session.State != "Active" || session.StopRequested || plan is null ||
-            plan.PlanId != session.FarmingPlanId || plan.StopRequested || !plan.ServiceRetainers ||
-            !configuration.MonitorRetainerVentures ||
-            plan.RetainerCheckpointOperationId is null && !farmingPlan.AllowsRetainerHandoffNow)
+        var parent = configuration.AutomationSession;
+        if (session.State != "Active" || session.StopRequested || parent is not { State: "Active", StopRequested: false } ||
+            parent.SessionId != session.SessionId || !parent.ServiceRetainers ||
+            plan is { State: "RecoveryRequired" or "PendingValidation" } ||
+            plan is not null && plan.RetainerCheckpointOperationId is null && !farmingPlan.AllowsRetainerHandoffNow)
             return false;
         if (!IsFarmingCharacterCurrent() || !IsSafePlayerState() || dungeonRun.Current is not null)
             return false;

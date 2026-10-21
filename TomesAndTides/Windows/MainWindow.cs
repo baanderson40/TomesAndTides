@@ -20,6 +20,10 @@ public sealed class MainWindow : Window
     private readonly IPluginLog log;
     private readonly Func<RetainerReadinessSnapshot?> readRetainerReadiness;
     private readonly RetainerHandoffController retainerHandoff;
+    private readonly AutomationSessionController automationSession;
+    private readonly OceanFishingHandoffController oceanFishing;
+    private readonly Func<(bool Known, IReadOnlyList<RetainerCharacterIdentity> Characters)> readRetainerRoster;
+    private bool confirmStandaloneAutomation;
     private bool confirmFarming;
     private DebugTests.DungeonOption? confirmedFarmingDungeon;
     private DebugTests.DutyModeSelection confirmedFarmingMode;
@@ -35,7 +39,9 @@ public sealed class MainWindow : Window
     public MainWindow(DebugSession session, Configuration configuration, DungeonRunController dungeonRun,
         FarmingPlanController farmingPlan,
         Action saveConfiguration, Action openDiagnostics, IPluginLog log,
-        Func<RetainerReadinessSnapshot?> readRetainerReadiness, RetainerHandoffController retainerHandoff)
+        Func<RetainerReadinessSnapshot?> readRetainerReadiness, RetainerHandoffController retainerHandoff,
+        AutomationSessionController automationSession, OceanFishingHandoffController oceanFishing,
+        Func<(bool Known, IReadOnlyList<RetainerCharacterIdentity> Characters)> readRetainerRoster)
         : base("Tomes & Tides##TomesAndTidesMain")
     {
         this.session = session;
@@ -47,6 +53,9 @@ public sealed class MainWindow : Window
         this.log = log;
         this.readRetainerReadiness = readRetainerReadiness;
         this.retainerHandoff = retainerHandoff;
+        this.automationSession = automationSession;
+        this.oceanFishing = oceanFishing;
+        this.readRetainerRoster = readRetainerRoster;
         TitleBarButtons.Add(new TitleBarButton
         {
             Icon = FontAwesomeIcon.Bug,
@@ -121,6 +130,11 @@ public sealed class MainWindow : Window
             if (ImGui.BeginTabItem("Retainers"))
             {
                 DrawRetainerPanel();
+                ImGui.EndTabItem();
+            }
+            if (ImGui.BeginTabItem("Ocean Fishing"))
+            {
+                DrawOceanFishingPanel();
                 ImGui.EndTabItem();
             }
             ImGui.EndTabBar();
@@ -321,13 +335,22 @@ public sealed class MainWindow : Window
                 if (ImGui.Button(plan.StopRequested ? "Stop requested" : "Stop automation", new Vector2(-1, 0)) && !plan.StopRequested)
                     retainerHandoff.RequestStop();
             }
-            else if (farmingPlan.CanResumeAfterReload)
+            else if (farmingPlan.CanResumeAfterReload && retainerHandoff.CanResumeAutomationSession &&
+                     oceanFishing.CanResumeAutomationSession)
             {
                 if (ImGui.Button("Acknowledge reload and resume plan", new Vector2(-1, 0)))
-                    farmingPlan.ResumeAfterReload();
+                {
+                    if (!farmingPlan.ResumeAfterReload(retainerHandoff.CanResumeAutomationSession &&
+                                                       oceanFishing.CanResumeAutomationSession))
+                        actionMessage = "Resume was not persisted. Automation remains blocked; verify the farming character and idle providers, then try again.";
+                    else
+                        actionMessage = "Captured automation session resumed. Fishing settings, handled windows, and verified plan progress are preserved.";
+                }
                 if (ImGui.Button("Acknowledge recovery and stop plan", new Vector2(-1, 0)))
                     farmingPlan.AcknowledgeRecoveryAndStop();
             }
+            else if (farmingPlan.Current is { State: "RecoveryRequired", RecoveryKind: "Reload" })
+                TextColoredWrapped(TomesTheme.Amber, "Resume is blocked until the farming character is safe, AutoDuty and providers are idle, and no fishing or retainer handoff needs recovery.");
             else if (farmingPlan.CanAcknowledgeRecovery && ImGui.Button("Acknowledge recovery and stop plan", new Vector2(-1, 0)))
                 farmingPlan.AcknowledgeRecoveryAndStop();
             if (plan.State is "Active" or "PendingValidation" or "RecoveryRequired")
@@ -450,7 +473,7 @@ public sealed class MainWindow : Window
                 actionMessage = $"Could not save retainer monitoring setting: {error.Message}";
             }
         }
-        TextDisabledWrapped("Readiness scans are read-only. Venture-service permission is captured when farming starts.");
+        TextDisabledWrapped("Readiness scans are read-only. Venture-service permission is captured when the automation session starts.");
         var waitMinutes = Math.Clamp(configuration.RetainerWaitBeforeDungeonMinutes, 0, 30);
         ImGui.TextWrapped("Wait before next dungeon when venture is within (minutes)");
         ImGui.SetNextItemWidth(Math.Min(300f * TomesTheme.Scale, ImGui.GetContentRegionAvail().X));
@@ -465,7 +488,7 @@ public sealed class MainWindow : Window
                 actionMessage = $"Could not save retainer wait setting: {error.Message}";
             }
         }
-        TextDisabledWrapped("0 waits only for ventures already ready; 30 waits up to half an hour. Active plans use the value captured at confirmation.");
+        TextDisabledWrapped("0 waits only for ventures already ready; 30 waits up to half an hour. Active sessions use the value captured at confirmation.");
         var snapshot = configuration.MonitorRetainerVentures ? readRetainerReadiness() : null;
         if (!configuration.MonitorRetainerVentures)
             TextDisabledWrapped("Enable monitoring to scan readiness. This setting does not change an already confirmed plan.");
@@ -511,6 +534,185 @@ public sealed class MainWindow : Window
         }
         if (!string.IsNullOrWhiteSpace(actionMessage))
             TextColoredWrapped(TomesTheme.Amber, actionMessage);
+    }
+
+    private void DrawOceanFishingPanel()
+    {
+        ImGui.Separator();
+        ImGui.TextWrapped("OCEAN FISHING HANDOFF");
+        ImGui.TextWrapped("Priority is Ocean Fishing → retainers → dungeon. WahTools manages route selection and movement; TT selects the character, requests one voyage per window, observes cleanup, and returns to the farming character.");
+        var enabled = configuration.OceanFishingEnabled;
+        if (ImGui.Checkbox("Enable Ocean Fishing in the next automation session", ref enabled))
+            SavePreference(() => configuration.OceanFishingEnabled = enabled, () => configuration.OceanFishingEnabled = !enabled,
+                "Ocean Fishing preference");
+
+        var lead = Math.Clamp(configuration.OceanFishingPreparationLeadMinutes, 0, 45);
+        ImGui.TextWrapped("Delay other work from this Ocean Fishing preparation lead (minutes)");
+        ImGui.SetNextItemWidth(Math.Min(300f * TomesTheme.Scale, ImGui.GetContentRegionAvail().X));
+        if (ImGui.SliderInt("##OceanFishingLead", ref lead, 0, 45))
+        {
+            var previous = configuration.OceanFishingPreparationLeadMinutes;
+            configuration.OceanFishingPreparationLeadMinutes = lead;
+            try { saveConfiguration(); }
+            catch (Exception error)
+            {
+                configuration.OceanFishingPreparationLeadMinutes = previous;
+                actionMessage = $"Could not save Ocean Fishing preparation lead: {error.Message}";
+            }
+        }
+        TextDisabledWrapped("Default 15 minutes; maximum 45. Registration occurs every even UTC hour. TT stops attempting a launch at minute 13; a missed window is skipped.");
+
+        var mode = configuration.OceanFishingCharacterMode == "SelectedCharacter" ? 1 : 0;
+        var modes = new[] { "Current farming character", "Selected AutoRetainer character" };
+        ImGui.SetNextItemWidth(Math.Min(300f * TomesTheme.Scale, ImGui.GetContentRegionAvail().X));
+        if (ImGui.Combo("Fishing character mode", ref mode, modes, modes.Length))
+        {
+            var previous = configuration.OceanFishingCharacterMode;
+            configuration.OceanFishingCharacterMode = mode == 0 ? "CurrentCharacter" : "SelectedCharacter";
+            try { saveConfiguration(); }
+            catch (Exception error)
+            {
+                configuration.OceanFishingCharacterMode = previous;
+                actionMessage = $"Could not save fishing character mode: {error.Message}";
+            }
+        }
+        if (configuration.OceanFishingCharacterMode == "SelectedCharacter")
+        {
+            var roster = readRetainerRoster();
+            if (!roster.Known)
+                TextColoredWrapped(TomesTheme.Amber, "AutoRetainer character roster unavailable; selected-character fishing is paused.");
+            else if (roster.Characters.Count == 0)
+                TextColoredWrapped(TomesTheme.Amber, "No registered characters were returned by AutoRetainer.");
+            else
+            {
+                var selected = roster.Characters.FirstOrDefault(character => character.ContentId == configuration.OceanFishingCharacterContentId);
+                var label = selected is null ? "Select registered character" : $"{selected.Name}@{selected.World}";
+                ImGui.SetNextItemWidth(Math.Min(300f * TomesTheme.Scale, ImGui.GetContentRegionAvail().X));
+                if (ImGui.BeginCombo("Fishing character", label))
+                {
+                    foreach (var character in roster.Characters)
+                    {
+                        if (!ImGui.Selectable($"{character.Name}@{character.World}##fisher-{character.ContentId}",
+                                character.ContentId == configuration.OceanFishingCharacterContentId))
+                            continue;
+                        var oldId = configuration.OceanFishingCharacterContentId;
+                        var oldName = configuration.OceanFishingCharacterName;
+                        var oldWorld = configuration.OceanFishingCharacterWorld;
+                        configuration.OceanFishingCharacterContentId = character.ContentId;
+                        configuration.OceanFishingCharacterName = character.Name;
+                        configuration.OceanFishingCharacterWorld = character.World;
+                        try { saveConfiguration(); }
+                        catch (Exception error)
+                        {
+                            configuration.OceanFishingCharacterContentId = oldId;
+                            configuration.OceanFishingCharacterName = oldName;
+                            configuration.OceanFishingCharacterWorld = oldWorld;
+                            actionMessage = $"Could not save fishing character selection: {error.Message}";
+                        }
+                    }
+                    ImGui.EndCombo();
+                }
+            }
+        }
+
+        if (oceanFishing.Current is { } operation)
+        {
+            TextColoredWrapped(TomesTheme.ForStatus(operation.State), $"Window {operation.WindowStartUtc.ToLocalTime():f} · {operation.State}");
+            ImGui.TextWrapped(operation.Detail);
+        }
+        else
+            TextDisabledWrapped($"WahTools: {(configuration.AutomationSession is { OceanFishingEnabled: true } ? "waiting for eligible window" : "not authorized in current session")}");
+
+        if (automationSession.Current is { State: "Active" or "StopRequested" } parent)
+        {
+            ImGui.Separator();
+            TextColoredWrapped(TomesTheme.ForStatus(parent.State), $"Automation session: {parent.State}");
+            ImGui.TextWrapped(parent.Detail);
+            if (parent.State == "Active" && ImGui.Button("Stop all automation", new Vector2(-1, 0)))
+                retainerHandoff.RequestStop();
+        }
+        else if (automationSession.NeedsRecovery)
+        {
+            TextColoredWrapped(TomesTheme.Rose, "Automation recovery required; no new provider requests will be issued.");
+            ImGui.TextWrapped(automationSession.Current?.Detail ?? "Inspect the saved operation before resuming.");
+            if (oceanFishing.NeedsRecovery && ImGui.Button("Acknowledge safe state and stop session", new Vector2(-1, 0)))
+                actionMessage = oceanFishing.AcknowledgeRecoveryAndStop()
+                    ? "Recovery acknowledged. Start a new session explicitly when ready."
+                    : "Recovery remains blocked: verify the farming character, safe state, AutoDuty, Lifestream, AutoRetainer, and WahTools cleanup.";
+        }
+        else
+        {
+            var snapshot = session.Dashboard;
+            var selectedValid = configuration.OceanFishingCharacterMode != "SelectedCharacter" ||
+                configuration.OceanFishingCharacterContentId != 0 &&
+                !string.IsNullOrWhiteSpace(configuration.OceanFishingCharacterName) &&
+                !string.IsNullOrWhiteSpace(configuration.OceanFishingCharacterWorld);
+            ImGui.BeginDisabled(snapshot is not { LoggedIn: true, CharacterContentId: not null } ||
+                                !configuration.MonitorRetainerVentures && !configuration.OceanFishingEnabled || !selectedValid);
+            if (ImGui.Button("Start fishing / retainer session…", new Vector2(-1, 0)))
+            {
+                confirmStandaloneAutomation = true;
+                ImGui.OpenPopup("Confirm automation session");
+            }
+            ImGui.EndDisabled();
+            if (snapshot is not { LoggedIn: true, CharacterContentId: not null })
+                TextDisabledWrapped("Log in and wait for a fresh farming-character snapshot before starting an automation session.");
+            else if (!configuration.MonitorRetainerVentures && !configuration.OceanFishingEnabled)
+                TextDisabledWrapped("Enable Ocean Fishing or retainer servicing before starting a session.");
+        }
+        DrawStandaloneAutomationConfirmation();
+    }
+
+    private void DrawStandaloneAutomationConfirmation()
+    {
+        if (!confirmStandaloneAutomation || !ImGui.BeginPopupModal("Confirm automation session", ref confirmStandaloneAutomation,
+                ImGuiWindowFlags.AlwaysAutoResize))
+            return;
+        var snapshot = session.Dashboard;
+        ImGui.TextWrapped($"Farming character: {snapshot?.CharacterName}@{snapshot?.CharacterHomeWorld}");
+        ImGui.TextWrapped($"Ocean Fishing: {(configuration.OceanFishingEnabled ? "enabled" : "disabled")} · preparation lead {Math.Clamp(configuration.OceanFishingPreparationLeadMinutes, 0, 45)} minutes.");
+        ImGui.TextWrapped($"Fishing character: {(configuration.OceanFishingCharacterMode == "CurrentCharacter" ? "farming character" : $"{configuration.OceanFishingCharacterName}@{configuration.OceanFishingCharacterWorld}")}");
+        ImGui.TextWrapped($"Retainer servicing: {(configuration.MonitorRetainerVentures ? "enabled" : "disabled")} · wait {Math.Clamp(configuration.RetainerWaitBeforeDungeonMinutes, 0, 30)} minutes.");
+        var linkedPlan = farmingPlan.Current is { State: "Active" } activePlan ? activePlan.PlanId : null;
+        ImGui.TextWrapped(linkedPlan is null
+            ? "No dungeon plan is attached. Fishing and retainers may continue until Stop."
+            : "The existing confirmed dungeon plan is attached; its daily allocations may run while fishing and retainers continue until Stop.");
+        ImGui.TextWrapped("Fishing has priority over retainers and dungeons. WahTools AutoOcean(false) is used before CatchTheBoat; TT will not retry an ambiguous launch. Weekly reset expires dungeon authorization only. A new weekly dungeon plan requires confirmation.");
+        if (ImGui.Button("Confirm session"))
+        {
+            try
+            {
+                if (snapshot?.CharacterContentId is not { } contentId || contentId == 0)
+                    throw new InvalidOperationException("Farming character identity unavailable.");
+                automationSession.StartOrResume(contentId, snapshot.CharacterName, snapshot.CharacterHomeWorld,
+                    configuration.MonitorRetainerVentures, Math.Clamp(configuration.RetainerWaitBeforeDungeonMinutes, 0, 30),
+                    configuration.OceanFishingEnabled, Math.Clamp(configuration.OceanFishingPreparationLeadMinutes, 0, 45),
+                    configuration.OceanFishingCharacterMode, configuration.OceanFishingCharacterContentId,
+                    configuration.OceanFishingCharacterName, configuration.OceanFishingCharacterWorld, linkedPlan);
+                actionMessage = "Automation session confirmed. Activity will be admitted in fishing → retainers → dungeon order.";
+            }
+            catch (Exception error) { actionMessage = error.Message; }
+            confirmStandaloneAutomation = false;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Cancel"))
+        {
+            confirmStandaloneAutomation = false;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.EndPopup();
+    }
+
+    private void SavePreference(Action apply, Action rollback, string description)
+    {
+        apply();
+        try { saveConfiguration(); }
+        catch (Exception error)
+        {
+            rollback();
+            actionMessage = $"Could not save {description}: {error.Message}";
+        }
     }
 
     private void DrawFarmingConfirmation()

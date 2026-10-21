@@ -45,6 +45,9 @@ public sealed class AutoRetainerClient : IRetainerProvider, IDisposable
 
     private sealed class OfflineCharacterDto
     {
+        public ulong CID { get; set; }
+        public string? Name { get; set; }
+        public string? World { get; set; }
         public bool? Enabled { get; set; }
         public List<OfflineRetainerDto>? RetainerData { get; set; }
     }
@@ -73,6 +76,27 @@ public sealed class AutoRetainerClient : IRetainerProvider, IDisposable
     }
 
     public event Action? SinglePassFinished;
+
+    public bool TryGetRegisteredCharacters(out IReadOnlyList<RetainerCharacterIdentity> characters)
+    {
+        try
+        {
+            characters = registeredCharacters.InvokeFunc()
+                .Select(cid => DeserializeIpc<OfflineCharacterDto>(offlineCharacterData.InvokeFunc(cid)))
+                .Where(data => !string.IsNullOrWhiteSpace(data.Name) && !string.IsNullOrWhiteSpace(data.World))
+                .Select(data => new RetainerCharacterIdentity(data.CID, data.Name!, data.World!))
+                .OrderBy(character => character.Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(character => character.World, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            return true;
+        }
+        catch (Exception error)
+        {
+            characters = [];
+            log.Warning(error, "AutoRetainer character roster unavailable; selected-character fishing is blocked.");
+            return false;
+        }
+    }
 
     public bool TryGetProviderState(out bool busy, out bool multiModeActive)
     {

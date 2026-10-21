@@ -6,6 +6,7 @@ public sealed class FarmingPlanController(
     Action save,
     DungeonRunController dungeonRun,
     IWorkflowGameState gameState,
+    AutomationSessionController automationSession,
     IWorkflowLog log,
     Func<DebugTests.LiveTomeState> readTomeState,
     Func<uint, DebugTests.DutyModeSelection, int, DebugReport> eligibility,
@@ -64,6 +65,10 @@ public sealed class FarmingPlanController(
             if (plan is not { State: "RecoveryRequired", RecoveryKind: "Reload" })
                 return false;
             if (configuration.RetainerHandoff is { State: "RecoveryRequired" })
+                return false;
+            if (configuration.AutomationSession is not { State: "RecoveryRequired", RecoveryKind: "Reload" } parent ||
+                parent.FarmingPlanId != plan.PlanId ||
+                configuration.OceanFishingOperation is { State: not ("Completed" or "Skipped" or "RecoveryAcknowledged") })
                 return false;
             var run = dungeonRun.Current;
             return FarmingSchedulePolicy.MayResumeAfterReload(run?.State, run?.RewardOutcome,
@@ -124,6 +129,11 @@ public sealed class FarmingPlanController(
             prior.Blocker = null;
             prior.RetryAfterUtc = null;
             configuration.RetainerSession = ResumeLinkedRetainerSession(prior, farmingCharacterName, farmingCharacterWorld, serviceRetainers);
+            automationSession.StartOrResume(expectedCharacterContentId, farmingCharacterName, farmingCharacterWorld,
+                serviceRetainers, retainerWaitMinutes, configuration.OceanFishingEnabled,
+                Math.Clamp(configuration.OceanFishingPreparationLeadMinutes, 0, 45), configuration.OceanFishingCharacterMode,
+                configuration.OceanFishingCharacterContentId, configuration.OceanFishingCharacterName,
+                configuration.OceanFishingCharacterWorld, prior.PlanId);
             if (!SavePlan(prior, "resume farming plan"))
                 throw new InvalidOperationException("Could not persist farming plan resume; recovery is required.");
             nextRefreshUtc = DateTimeOffset.MinValue;
@@ -161,6 +171,11 @@ public sealed class FarmingPlanController(
         plan.FinishDeadlineUtc = FarmingSchedulePolicy.GetFinishDeadlineUtc(plan.WeekStartUtc, periodsToUse);
         configuration.FarmingPlan = plan;
         configuration.RetainerSession = CreateLinkedRetainerSession(plan, farmingCharacterName, farmingCharacterWorld, serviceRetainers);
+        automationSession.StartOrResume(expectedCharacterContentId, farmingCharacterName, farmingCharacterWorld,
+            serviceRetainers, retainerWaitMinutes, configuration.OceanFishingEnabled,
+            Math.Clamp(configuration.OceanFishingPreparationLeadMinutes, 0, 45), configuration.OceanFishingCharacterMode,
+            configuration.OceanFishingCharacterContentId, configuration.OceanFishingCharacterName,
+            configuration.OceanFishingCharacterWorld, plan.PlanId);
         var archivedPrior = previousPlan is not null && previousPlan.WeekStartUtc != plan.WeekStartUtc;
         if (archivedPrior)
         {
@@ -228,15 +243,31 @@ public sealed class FarmingPlanController(
         return SavePlan(plan, "recovery acknowledgment");
     }
 
-    public bool ResumeAfterReload()
+    public bool ResumeAfterReload(bool automationSafe)
     {
         var plan = Current;
-        if (plan is null || !CanResumeAfterReload)
+        if (plan is null || !CanResumeAfterReload || !automationSafe)
             return false;
+        var previousState = plan.State;
+        var previousDetail = plan.Detail;
+        var previousRecoveryKind = plan.RecoveryKind;
+        var previousStopRequested = plan.StopRequested;
+        var previousCurrentOperationId = plan.CurrentOperationId;
+        var previousBlocker = plan.Blocker;
+        var previousRetryAfterUtc = plan.RetryAfterUtc;
+        var priorRetainerSession = configuration.RetainerSession;
+        var priorRetainerState = priorRetainerSession?.State;
+        var priorRetainerDetail = priorRetainerSession?.Detail;
+        var priorRetainerStopRequested = priorRetainerSession?.StopRequested;
+        var priorRetainerRecoveryKind = priorRetainerSession?.RecoveryKind;
         var run = dungeonRun.Current;
         if (run is { State: "Completed", RewardOutcome: "Verified" } && !CreditVerifiedRun(plan, run))
             return false;
         if (run is not null && !dungeonRun.Acknowledge())
+            return false;
+        var rollbackAutomation = automationSession.PrepareReloadResume(plan.PlanId, plan.CharacterContentId,
+            plan.FarmingCharacterName, plan.FarmingCharacterWorld);
+        if (rollbackAutomation is null)
             return false;
         plan.CurrentOperationId = null;
         plan.RecoveryKind = null;
@@ -248,14 +279,41 @@ public sealed class FarmingPlanController(
         configuration.RetainerSession = ResumeLinkedRetainerSession(plan, plan.FarmingCharacterName,
             plan.FarmingCharacterWorld, plan.ServiceRetainers);
         nextRefreshUtc = DateTimeOffset.MinValue;
-        return SavePlan(plan, "resume after reload recovery");
+        try
+        {
+            save();
+            log.Information("Farming plan {PlanId} and automation session {SessionId} resumed after reload; plan progress and captured settings preserved.",
+                plan.PlanId, configuration.AutomationSession?.SessionId ?? "unknown");
+            return true;
+        }
+        catch (Exception error)
+        {
+            plan.State = previousState;
+            plan.Detail = previousDetail;
+            plan.RecoveryKind = previousRecoveryKind;
+            plan.StopRequested = previousStopRequested;
+            plan.CurrentOperationId = previousCurrentOperationId;
+            plan.Blocker = previousBlocker;
+            plan.RetryAfterUtc = previousRetryAfterUtc;
+            configuration.RetainerSession = priorRetainerSession;
+            if (priorRetainerSession is not null)
+            {
+                priorRetainerSession.State = priorRetainerState!;
+                priorRetainerSession.Detail = priorRetainerDetail!;
+                priorRetainerSession.StopRequested = priorRetainerStopRequested!.Value;
+                priorRetainerSession.RecoveryKind = priorRetainerRecoveryKind;
+            }
+            rollbackAutomation();
+            log.Error(error, "Farming plan {PlanId} reload resume could not persist; all automation remains blocked.", plan.PlanId);
+            return false;
+        }
     }
 
-    public void Tick(bool externalCharacterHandoffOwns = false)
+    public void Tick(bool externalCharacterHandoffOwns = false, bool allowDispatch = true)
     {
         try
         {
-            TickCore(externalCharacterHandoffOwns);
+            TickCore(externalCharacterHandoffOwns, allowDispatch);
         }
         catch (Exception error)
         {
@@ -269,7 +327,7 @@ public sealed class FarmingPlanController(
         }
     }
 
-    private void TickCore(bool externalCharacterHandoffOwns)
+    private void TickCore(bool externalCharacterHandoffOwns, bool allowDispatch)
     {
         var plan = Current;
         if (plan is null)
@@ -459,6 +517,11 @@ public sealed class FarmingPlanController(
                 now, plan.FinishDeadlineUtc, plan.WeeklyResetUtc,
                 currentPeriod.CompletedRuns, currentPeriod.AllocatedRuns) != FarmingSchedulePolicy.QueueDecision.Queue)
             return;
+        if (!allowDispatch)
+        {
+            nextRefreshUtc = DateTimeOffset.MinValue;
+            return;
+        }
 
         var dungeon = findDungeon(plan.TerritoryId);
         if (dungeon is null || dungeon.ContentFinderConditionId != plan.ContentFinderConditionId || dungeon.Reward != plan.DungeonReward)

@@ -4,13 +4,22 @@ namespace TomesAndTides;
 
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 2;
+    public int Version { get; set; } = 3;
     public bool EnableAutoDutyLoopActions { get; set; }
     public uint MainSelectedTerritory { get; set; }
     public int MainSelectedDutyMode { get; set; }
     public int FarmingPeriodsToUse { get; set; } = 7;
     public bool MonitorRetainerVentures { get; set; }
     public int RetainerWaitBeforeDungeonMinutes { get; set; } = 5;
+    public bool OceanFishingEnabled { get; set; }
+    public int OceanFishingPreparationLeadMinutes { get; set; } = 15;
+    public string OceanFishingCharacterMode { get; set; } = "CurrentCharacter";
+    public ulong OceanFishingCharacterContentId { get; set; }
+    public string OceanFishingCharacterName { get; set; } = string.Empty;
+    public string OceanFishingCharacterWorld { get; set; } = string.Empty;
+    public AutomationSessionRecord? AutomationSession { get; set; }
+    public OceanFishingOperationRecord? OceanFishingOperation { get; set; }
+    public List<DateTimeOffset> HandledOceanFishingWindowsUtc { get; set; } = [];
     public RetainerAutomationSessionRecord? RetainerSession { get; set; }
     public RetainerHandoffRecord? RetainerHandoff { get; set; }
     public DungeonRunRecord? DungeonRun { get; set; }
@@ -18,10 +27,57 @@ public sealed class Configuration : IPluginConfiguration
     public List<FarmingPlanRecord> FarmingPlanHistory { get; set; } = [];
 }
 
+public sealed class AutomationSessionRecord
+{
+    public string SessionId { get; set; } = string.Empty;
+    public string State { get; set; } = "Stopped";
+    public string Detail { get; set; } = string.Empty;
+    public ulong FarmingCharacterContentId { get; set; }
+    public string FarmingCharacterName { get; set; } = string.Empty;
+    public string FarmingCharacterWorld { get; set; } = string.Empty;
+    public string? FarmingPlanId { get; set; }
+    public bool ServiceRetainers { get; set; }
+    public int RetainerWaitBeforeDungeonMinutes { get; set; } = 5;
+    public bool OceanFishingEnabled { get; set; }
+    public int OceanFishingPreparationLeadMinutes { get; set; } = 15;
+    public string OceanFishingCharacterMode { get; set; } = "CurrentCharacter";
+    public ulong OceanFishingCharacterContentId { get; set; }
+    public string OceanFishingCharacterName { get; set; } = string.Empty;
+    public string OceanFishingCharacterWorld { get; set; } = string.Empty;
+    public DateTimeOffset CreatedUtc { get; set; }
+    public bool StopRequested { get; set; }
+    public string? RecoveryKind { get; set; }
+}
+
+public sealed class OceanFishingOperationRecord
+{
+    public string OperationId { get; set; } = string.Empty;
+    public string SessionId { get; set; } = string.Empty;
+    public DateTimeOffset WindowStartUtc { get; set; }
+    public ulong FarmingCharacterContentId { get; set; }
+    public string FarmingCharacterName { get; set; } = string.Empty;
+    public string FarmingCharacterWorld { get; set; } = string.Empty;
+    public ulong FishingCharacterContentId { get; set; }
+    public string FishingCharacterName { get; set; } = string.Empty;
+    public string FishingCharacterWorld { get; set; } = string.Empty;
+    public string State { get; set; } = "WindowClaimed";
+    public string Detail { get; set; } = string.Empty;
+    public DateTimeOffset PhaseChangedUtc { get; set; }
+    public DateTimeOffset? OutboundIntentUtc { get; set; }
+    public DateTimeOffset? LaunchIntentUtc { get; set; }
+    public DateTimeOffset? ReturnIntentUtc { get; set; }
+    public bool LaunchAmbiguous { get; set; }
+    public bool DutyStarted { get; set; }
+    public bool DutyCompleted { get; set; }
+    public bool OceanTerritoryEntered { get; set; }
+    public string? RecoveryKind { get; set; }
+}
+
 public sealed class RetainerAutomationSessionRecord
 {
     public string SessionId { get; set; } = string.Empty;
     public string State { get; set; } = "Stopped";
+    public string? RecoveryKind { get; set; }
     public string Detail { get; set; } = string.Empty;
     public ulong FarmingCharacterContentId { get; set; }
     public string FarmingCharacterName { get; set; } = string.Empty;

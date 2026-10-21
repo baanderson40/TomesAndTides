@@ -7,5 +7,8 @@ public interface IRetainerProvider
     event Action? SinglePassFinished;
     bool TryGetProviderState(out bool busy, out bool multiModeActive);
     RetainerReadinessSnapshot ReadReadiness(ulong currentCharacterContentId = 0);
+    bool TryGetRegisteredCharacters(out IReadOnlyList<RetainerCharacterIdentity> characters);
     void RequestSingleRetainerPass();
 }
+
+public sealed record RetainerCharacterIdentity(ulong ContentId, string Name, string World);
