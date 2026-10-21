@@ -6,6 +6,7 @@ using Dalamud.Plugin.Services;
 using Dalamud.Game.ClientState.Conditions;
 using TomesAndTides.Debugging;
 using TomesAndTides.Windows;
+using TomesAndTides.Integrations;
 
 namespace TomesAndTides;
 
@@ -32,6 +33,10 @@ public sealed class Plugin : IDalamudPlugin
     private readonly Configuration configuration;
     private readonly DungeonRunController dungeonRun;
     private readonly FarmingPlanController farmingPlan;
+    private readonly AutoRetainerClient autoRetainer;
+    private readonly RetainerHandoffController retainerHandoff;
+    private RetainerReadinessSnapshot? retainerReadiness;
+    private DateTimeOffset nextRetainerScanUtc;
     private readonly bool aliasRegistered;
     private DateTimeOffset nextDashboardRefreshUtc;
 
@@ -39,6 +44,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         var loadedUtc = DateTimeOffset.UtcNow;
         configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        autoRetainer = new AutoRetainerClient(PluginInterface, Log);
         var debugTests = new DebugTests(Data, Client, Objects, PluginInterface, Unlocks, PlayerState, Conditions, configuration);
         session = new DebugSession(debugTests, Log);
         dungeonRun = new DungeonRunController(configuration, SaveConfiguration, PluginInterface,
@@ -47,9 +53,17 @@ public sealed class Plugin : IDalamudPlugin
         farmingPlan = new FarmingPlanController(configuration, SaveConfiguration, dungeonRun, PlayerState, Log,
             debugTests.ReadLiveTomeState, debugTests.CheckEligibility,
             territory => session.DungeonChoices.FirstOrDefault(choice => choice.Territory == territory));
+        var lifestream = new LifestreamClient(PluginInterface);
+        retainerHandoff = new RetainerHandoffController(configuration, SaveConfiguration, autoRetainer, lifestream,
+            Client, Objects, PlayerState, Conditions, DutyState, dungeonRun, farmingPlan,
+            () => retainerReadiness, RefreshRetainerReadiness, debugTests.ReadAutoDutyStopped, Log);
+        retainerHandoff.Subscribe();
         farmingPlan.RecoverAfterReload();
-        mainWindow = new MainWindow(session, configuration, dungeonRun, farmingPlan, SaveConfiguration, OpenDiagnostics, Log);
-        debugWindow = new DebugWindow(session, OpenMain);
+        retainerHandoff.RecoverAfterReload();
+        mainWindow = new MainWindow(session, configuration, dungeonRun, farmingPlan, SaveConfiguration, OpenDiagnostics, Log,
+            () => retainerReadiness, retainerHandoff);
+        debugWindow = new DebugWindow(session, configuration, dungeonRun, farmingPlan, retainerHandoff,
+            SaveConfiguration, Log, OpenMain);
         if (!Commands.AddHandler(MainCommand, new CommandInfo(OnCommand)
             { HelpMessage = "Open the Tomes & Tides main window." }))
             throw new InvalidOperationException($"Command {MainCommand} is already registered.");
@@ -80,14 +94,22 @@ public sealed class Plugin : IDalamudPlugin
         if (aliasRegistered)
             Commands.RemoveHandler(Alias);
         dungeonRun.Dispose();
+        retainerHandoff.Dispose();
+        autoRetainer.Dispose();
         windows.RemoveAllWindows();
     }
 
     private void OnUpdate(IFramework framework)
     {
-        farmingPlan.Tick();
+        farmingPlan.Tick(retainerHandoff.OwnsActivity);
+        retainerHandoff.Tick();
         dungeonRun.Tick();
         session.Tick();
+        if (configuration.MonitorRetainerVentures && DateTimeOffset.UtcNow >= nextRetainerScanUtc)
+        {
+            RefreshRetainerReadiness();
+            nextRetainerScanUtc = DateTimeOffset.UtcNow.AddSeconds(15);
+        }
         if (DateTimeOffset.UtcNow < nextDashboardRefreshUtc)
             return;
 
@@ -112,6 +134,12 @@ public sealed class Plugin : IDalamudPlugin
         nextDashboardRefreshUtc = DateTimeOffset.UtcNow.AddSeconds(5);
     }
     private void SaveConfiguration() => PluginInterface.SavePluginConfig(configuration);
+    private RetainerReadinessSnapshot RefreshRetainerReadiness()
+    {
+        retainerReadiness = autoRetainer.ReadReadiness(PlayerState.ContentId);
+        nextRetainerScanUtc = DateTimeOffset.UtcNow.AddSeconds(15);
+        return retainerReadiness;
+    }
     private void OpenMain() => mainWindow.IsOpen = true;
     private void OpenDiagnostics() => debugWindow.IsOpen = true;
     private void OnCommand(string command, string arguments) => mainWindow.Toggle();

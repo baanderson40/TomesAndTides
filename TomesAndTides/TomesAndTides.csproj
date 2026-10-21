@@ -6,7 +6,7 @@
     <OutputPath>bin\x64\$(Configuration)\</OutputPath>
     <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
     <Version>0.1.0.0</Version>
-    <Description>Read-only diagnostics and explicitly confirmed single-run AutoDuty testing for Tomes &amp; Tides.</Description>
+    <Description>Weekly tome farming and explicitly authorized AutoRetainer retainer handoffs for Tomes &amp; Tides.</Description>
     <Authors>baanderson40</Authors>
     <Product>Tomes &amp; Tides</Product>
     <IsPackable>false</IsPackable>
@@ -15,4 +15,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="ECommons" Version="3.2.1.17" />
+  </ItemGroup>
 </Project>

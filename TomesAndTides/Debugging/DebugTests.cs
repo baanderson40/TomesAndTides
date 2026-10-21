@@ -154,14 +154,15 @@ public sealed class DebugTests(
         if (inventory == null)
             return new(captured, true, playerState.ContentId, player.Name.ToString(), currency.Name, null, null, null,
                 ReadAutoDutyStopped(), selectedTerritory, mode, eligibility,
-                "InventoryManager is unavailable.");
+                "InventoryManager is unavailable.", player.HomeWorld.Value.Name.ToString());
 
         return new(captured, true, playerState.ContentId, player.Name.ToString(), currency.Name,
             inventory->GetWeeklyAcquiredTomestoneCount(), InventoryManager.GetLimitedTomestoneWeeklyLimit(),
-            inventory->GetTomestoneCount(currency.ItemId), ReadAutoDutyStopped(), selectedTerritory, mode, eligibility);
+            inventory->GetTomestoneCount(currency.ItemId), ReadAutoDutyStopped(), selectedTerritory, mode, eligibility,
+            CharacterHomeWorld: player.HomeWorld.Value.Name.ToString());
     }
 
-    private bool? ReadAutoDutyStopped()
+    public bool? ReadAutoDutyStopped()
     {
         try { return pluginInterface.GetIpcSubscriber<bool>("AutoDuty.IsStopped").InvokeFunc(); }
         catch { return null; }

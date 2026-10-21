@@ -137,6 +137,46 @@ var tests = new (string Name, Action Run)[]
             FarmingSchedulePolicy.MayResumeAfterReload("Failed", "Unknown", true, false, "run-2", credited))
             throw new InvalidOperationException("Reload recovery admission mismatch.");
     }),
+    ("retainer pass requires explicit session and fresh safe readiness", () =>
+    {
+        bool Admit(bool session = true, bool stop = false, bool monitor = true, bool beforeReset = true,
+            bool dungeonPriority = true, bool dungeonOperation = false, bool handoffOwned = false,
+            bool known = true, bool ready = true, bool fresh = true, bool cooldown = true) =>
+            RetainerHandoffPolicy.MayRequestPass(session, stop, monitor, beforeReset, dungeonPriority,
+                dungeonOperation, handoffOwned, known, ready, fresh, cooldown);
+
+        if (!Admit() || Admit(session: false) || Admit(stop: true) || Admit(monitor: false) ||
+            Admit(dungeonPriority: false) || Admit(dungeonOperation: true) || Admit(handoffOwned: true) ||
+            Admit(known: false) || Admit(ready: false) || Admit(fresh: false) || Admit(cooldown: false))
+            throw new InvalidOperationException("Retainer pass admission accepted an unsafe or unauthorized state.");
+    }),
+    ("retainer ownership release needs event, idle, identity, and safe return", () =>
+    {
+        bool Release(bool completion = true, bool idle = true, bool stable = true, bool character = true,
+            bool safe = true, bool autoDuty = true, bool lifestream = true) =>
+            RetainerHandoffPolicy.MayReleaseOwnership(completion, idle, stable, character, safe, autoDuty, lifestream);
+
+        if (!Release() || Release(completion: false) || Release(idle: false) || Release(stable: false) ||
+            Release(character: false) || Release(safe: false) || Release(autoDuty: false) || Release(lifestream: false))
+            throw new InvalidOperationException("Retainer ownership released without complete safe-return evidence.");
+    }),
+    ("unchanged ready venture work requires review instead of repeated passes", () =>
+    {
+        if (!RetainerHandoffPolicy.IsUnchangedReadyWork("same", "same") ||
+            RetainerHandoffPolicy.IsUnchangedReadyWork("old", "new") ||
+            RetainerHandoffPolicy.IsUnchangedReadyWork(null, "same") ||
+            RetainerHandoffPolicy.IsUnchangedReadyWork("same", string.Empty))
+            throw new InvalidOperationException("Retainer readiness fingerprint review policy mismatch.");
+    }),
+    ("near-complete venture wait respects configured 0-30 minute window", () =>
+    {
+        bool Wait(long? seconds, int minutes, bool known = true, bool ready = false) =>
+            RetainerHandoffPolicy.ShouldWaitForNearCompleteVenture(known, ready, seconds, minutes);
+
+        if (!Wait(300, 5) || Wait(301, 5) || Wait(1, 0) || !Wait(0, 0) ||
+            Wait(60, 31) || Wait(60, 5, known: false) || Wait(60, 5, ready: true) || Wait(null, 5))
+            throw new InvalidOperationException("Near-complete venture wait threshold policy mismatch.");
+    }),
 };
 
 var failures = 0;

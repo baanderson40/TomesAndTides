@@ -20,7 +20,7 @@ internal static class TomesTheme
     public static readonly Vector4 Amber = Rgb(0xFFD38A);
     public static readonly Vector4 Rose = Rgb(0xEE7788);
 
-    private const int StyleVarCount = 9;
+    private const int StyleVarCount = 10;
     private static readonly (ImGuiCol Slot, Vector4 Color)[] Colors =
     [
         (ImGuiCol.WindowBg, Window), (ImGuiCol.ChildBg, Panel), (ImGuiCol.PopupBg, Panel),
@@ -56,6 +56,7 @@ internal static class TomesTheme
         ImGui.PushStyleVar(ImGuiStyleVar.ChildRounding, 6 * scale);
         ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 4 * scale);
         ImGui.PushStyleVar(ImGuiStyleVar.FrameBorderSize, scale);
+        ImGui.PushStyleVar(ImGuiStyleVar.TabRounding, 6 * scale);
         foreach (var (slot, color) in Colors)
             ImGui.PushStyleColor(slot, color);
     }

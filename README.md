@@ -1,15 +1,18 @@
 # Tomes & Tides
 
-Dalamud plugin coordinating weekly-capped tome farming; Ocean Fishing and AutoRetainer are planned.
+Dalamud plugin coordinating weekly-capped tome farming and optional AutoRetainer handoffs; Ocean Fishing is planned.
 Commands: `/tomestides`, alias `/tt` (subject to availability).
 
 ## Current stage
 
-Dalamud API 15 plugin with themed main and Diagnostics windows, Phase 1 offline
-reward audit, an explicitly confirmed one-run action, and a manually started
-persisted weekly tome farming plan. Plan distributes dungeon runs across 1–7
-reset-aligned daily periods and uses AutoDuty one run at a time. Ocean Fishing
-and retainer automation are not implemented. No tests run automatically on load.
+Dalamud API 15 plugin with themed tabbed main and Diagnostics windows, offline
+reward audit, explicitly confirmed one-run action, and manually started persisted
+weekly tome farming plan. Plan distributes dungeon runs across 1–7 reset-aligned
+periods and uses AutoDuty one run at a time. Optional AutoRetainer service is
+captured in the confirmed farming plan: after each verified dungeon, TT checks
+ventures and may complete one Retainers-only pass and return to the farming
+character before the next dungeon. The Retainers tab configures a 0–30 minute
+near-complete wait (default 5). Ocean Fishing is not implemented.
 
 ## Build and load the debug plugin
 
@@ -27,11 +30,12 @@ D:\Coding\C#\Tomes & Tides\TomesAndTides\bin\x64\Release\TomesAndTides.dll
 
 Open the main window with `/tomestides` or `/tt`. If another plugin owns `/tt`,
 the long command remains available. The plugin installer main/config buttons also
-open the main window; its Diagnostics button opens the separate debug window.
+open the main window; the title-bar bug icon opens Diagnostics.
 
-The themed main window shows cached character/tome state, independent dungeon and
-mode selections, readiness, the AutoDuty action option, a separately confirmed
-one-run action, and a confirmed farming plan. Configure finish within the first
+The themed main window uses Current Character, Farming Plan, Dungeon Setup, and
+Retainers tabs; Diagnostics remains in the title-bar bug icon. Current Character
+shows cached character/tome state and farming start/stop; the Farming Plan tab
+shows allocations and current-period progress. Configure finish within the first
 1–7 weekly periods. Periods begin at 08:00 UTC. The plan persists allocations,
 period progress, stop requests, and verified operation IDs; missed work is
 redistributed across remaining periods using fresh weekly progress. Stop blocks
@@ -99,6 +103,14 @@ same capped currency concurrently. Plan operation blocks automatically on
 unverified reward, ambiguous launch, character change, or unknown provider/data
 state. TT never retries an uncertain AutoDuty launch, stops AutoDuty, or abandons
 a duty.
+
+Retainer service permission is captured when the farming plan is confirmed and
+does not start independently. Each verified dungeon creates a persisted checkpoint;
+TT waits for near-complete ventures within the configured threshold, requests at
+most one Retainers-only pass, verifies completion and stable provider idle, then
+returns to the farming character before continuing. Uncertain pass/return outcomes
+require explicit recovery. Combined-flow checkpoint, Stop, reload, and return
+behavior have not yet completed in-game acceptance.
 
 See [dungeon reward findings](docs/dungeon-rewards.md).
 

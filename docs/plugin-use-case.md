@@ -35,10 +35,18 @@ must not be mistaken for a fixed run count.
 
 ## Retainer ventures
 
-When ventures are ready, TT can request AutoRetainer's **single-pass Multi
-Mode**. It observes the pass through completion and waits for AutoRetainer idle
-before returning to dungeon work. TT does not start continuous Multi Mode or
-take over an already-running AutoRetainer session.
+Retainer service is an option on the Retainers tab and is captured when the
+weekly farming plan is confirmed. After each verified dungeon, TT persists a
+checkpoint before allowing the next dungeon. A fresh readiness scan either
+clears it, waits for a selected venture due within the configured 0–30 minute
+window (default 5), or requests one AutoRetainer **Retainers-only single-pass
+Multi Mode**. TT observes the owned pass through its completion event and stable
+AutoRetainer idle, then requests a one-time Lifestream return and verifies the
+farming character Content ID before clearing the checkpoint. TT does not start
+continuous Multi Mode or take over an already-running AutoRetainer session. The
+wait threshold and service permission are captured in the plan; reload pauses
+the combined flow for explicit recovery. Unchanged ready work after a pass pauses
+for review rather than looping empty passes.
 
 ## Ocean Fishing
 
@@ -54,10 +62,11 @@ claimed window. Ambiguous launches are observed, not blindly retried.
 
 ## Coordination and controls
 
-- Tome work has priority when its period allocation is due.
+- A persisted retainer checkpoint after each verified dungeon must settle before
+  the next dungeon can launch.
 - Active duties, voyages, and owned AutoRetainer passes are never interrupted.
 - When a period's dungeon allocation is complete—or weekly cap is reached—TT
-  may continue enabled retainer and fishing work until the next period or Stop.
+  may continue enabled retainer monitoring until the next period or Stop.
 - Completing the tome plan does not by itself stop an active overall session;
   enabled retainer and fishing work may continue until user Stop or the weekly
   reset/finish boundary.
@@ -95,21 +104,25 @@ allow configured termination actions to run.
 - Persisted 1–7-period weekly tome plan, 08:00 UTC boundaries, period allocation,
   missed-work redistribution, Stop/Start ledger preservation, early finish,
   weekly expiry, and automatic one-run chaining after verified reward.
+- Opt-in AutoRetainer readiness scanning using its advance timer and wait-for-all
+  setting; unknown IPC payloads fail closed.
+- Explicit weekly retainer automation session; due dungeon allocations retain
+  priority, and an owned Retainers-only pass is dispatched at most once.
+- Persisted pass completion/idle observation, one-time Lifestream return and
+  farming-character verification; Stop completes owned cleanup and reload or
+  ambiguous provider outcomes require explicit recovery.
 - Main-window plan confirmation, progress/blocker view, stop-after-current-run,
   and recovery acknowledgment.
 - In-game Clyteum Trust run verified with a +50 weekly tomestone gain.
 
 ### Gaps: planned, not implemented
 
-- AutoRetainer: readiness rules, single-pass Multi Mode request, owned-pass
-  observation/cleanup, and farming-character return.
 - Ocean Fishing: character selector and roster, eligible-window scheduling,
   one-voyage WahTools request, voyage/cleanup observation, and return travel.
-- Cross-activity coordination, including safe handoff ownership and priority
-  when tome work and fishing windows overlap.
-- Controller-level tests for persistence failures, reloads, stop boundaries,
-  and multi-run dispatch; current automated coverage tests pure UTC allocation,
-  run-count, stop/deadline, and idempotent-credit policies.
+- Controller-level fake-provider tests for retainer persistence failures,
+  completion correlation, reloads, stop boundaries, return mismatch/timeouts,
+  and dungeon-vs-retainer exclusion. Existing automated coverage tests pure
+  tome policy and schedule behavior; live provider and in-game acceptance remain.
 
 ### Remaining one-run limits relevant to future coordination
 
@@ -120,5 +133,5 @@ allow configured termination actions to run.
   acceptance remains required in game. Live provider compatibility also needs
   validation.
 
-The farming coordinator is implemented but not yet fully accepted in game.
-AutoRetainer and Ocean Fishing handoffs remain unimplemented.
+The farming coordinator and AutoRetainer handoff are implemented but not yet fully
+accepted in game. Ocean Fishing handoffs remain unimplemented.

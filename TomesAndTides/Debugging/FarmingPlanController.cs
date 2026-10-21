@@ -19,6 +19,25 @@ public sealed class FarmingPlanController(
 
     public FarmingPlanRecord? Current => configuration.FarmingPlan;
     public bool IsActive => Current is { State: "Active" or "PendingValidation" };
+    public bool AllowsRetainerHandoffNow
+    {
+        get
+        {
+            var plan = Current;
+            if (plan is null)
+                return true;
+            if (plan.State is "PendingValidation" or "RecoveryRequired")
+                return false;
+            if (plan.State is not "Active")
+                return true;
+            var now = DateTimeOffset.UtcNow;
+            if (plan.StopRequested || now >= plan.FinishDeadlineUtc || now >= plan.WeeklyResetUtc)
+                return true;
+            var periodStart = FarmingSchedulePolicy.GetPeriodStartUtc(now, plan.WeekStartUtc);
+            var period = plan.Periods.FirstOrDefault(item => item.StartUtc == periodStart);
+            return period is not null && period.CompletedRuns >= period.AllocatedRuns;
+        }
+    }
     public bool BlocksManualRun => Current is { State: "Active" or "PendingValidation" or "RecoveryRequired" };
     public bool CanStart
     {
@@ -44,6 +63,8 @@ public sealed class FarmingPlanController(
             var plan = Current;
             if (plan is not { State: "RecoveryRequired", RecoveryKind: "Reload" })
                 return false;
+            if (configuration.RetainerHandoff is { State: "RecoveryRequired" })
+                return false;
             var run = dungeonRun.Current;
             return FarmingSchedulePolicy.MayResumeAfterReload(run?.State, run?.RewardOutcome,
                 run is null || run.FarmingPlanId == plan.PlanId && run.OperationId == plan.CurrentOperationId,
@@ -65,22 +86,36 @@ public sealed class FarmingPlanController(
     }
 
     public bool QueueStart(DebugTests.DungeonOption dungeon, DebugTests.DutyModeSelection mode,
-        int gearsetId, bool bareMode, int periodsToUse, ulong expectedCharacterContentId)
+        int gearsetId, bool bareMode, int periodsToUse, ulong expectedCharacterContentId,
+        string farmingCharacterName, string farmingCharacterWorld, bool serviceRetainers, int retainerWaitMinutes)
     {
         if (periodsToUse is < 1 or > 7)
             throw new InvalidOperationException("Choose between 1 and 7 weekly periods.");
+        if (retainerWaitMinutes is < 0 or > 30)
+            throw new InvalidOperationException("Retainer wait must be between 0 and 30 minutes.");
 
         var previousPlan = configuration.FarmingPlan;
+        var previousRetainerSession = configuration.RetainerSession;
+        if (configuration.RetainerHandoff is { State: not ("Completed" or "RecoveryAcknowledged") } ||
+            previousRetainerSession is { State: "RecoveryRequired" })
+            throw new InvalidOperationException("Resolve the existing retainer handoff/session before starting or resuming farming.");
         if (previousPlan is { State: "Stopped" } prior &&
             prior.WeekStartUtc == FarmingSchedulePolicy.GetWeekStartUtc(DateTimeOffset.UtcNow) &&
             DateTimeOffset.UtcNow < prior.FinishDeadlineUtc)
         {
+            if (configuration.RetainerSession is { State: "Active" or "StopRequested" } legacySession &&
+                legacySession.FarmingPlanId != prior.PlanId)
+                throw new InvalidOperationException("Resolve the existing retainer handoff/session before resuming this farming plan.");
             if (prior.CharacterContentId != expectedCharacterContentId || prior.TerritoryId != dungeon.Territory ||
                 prior.ContentFinderConditionId != dungeon.ContentFinderConditionId || prior.DungeonReward != dungeon.Reward ||
                 !string.Equals(prior.Mode, mode.ToString(), StringComparison.Ordinal) ||
                 prior.GearsetInspectionId != gearsetId || prior.BareMode != bareMode ||
                 prior.FinishDeadlineUtc != FarmingSchedulePolicy.GetFinishDeadlineUtc(prior.WeekStartUtc, periodsToUse))
-                throw new InvalidOperationException("Stopped plan can resume only with its original character, dungeon, mode, and finish period.");
+                throw new InvalidOperationException("Stopped plan can resume only with its original character, dungeon, mode, bare-mode, and finish period.");
+            prior.ServiceRetainers = serviceRetainers;
+            prior.RetainerWaitBeforeDungeonMinutes = retainerWaitMinutes;
+            prior.FarmingCharacterName = farmingCharacterName;
+            prior.FarmingCharacterWorld = farmingCharacterWorld;
             prior.StopRequested = false;
             prior.State = prior.Periods.Count == 0 ? "PendingValidation" : "Active";
             prior.Detail = prior.Periods.Count == 0
@@ -88,13 +123,18 @@ public sealed class FarmingPlanController(
                 : "Plan resumed; completed period progress is preserved.";
             prior.Blocker = null;
             prior.RetryAfterUtc = null;
+            configuration.RetainerSession = ResumeLinkedRetainerSession(prior, farmingCharacterName, farmingCharacterWorld, serviceRetainers);
             if (!SavePlan(prior, "resume farming plan"))
                 throw new InvalidOperationException("Could not persist farming plan resume; recovery is required.");
-            log.Information("Farming plan {PlanId} resumed; completed period ledger preserved.", prior.PlanId);
+            nextRefreshUtc = DateTimeOffset.MinValue;
+            log.Information("Farming plan {PlanId} resumed; completed period ledger preserved, retainer service={ServiceRetainers}, waitMinutes={WaitMinutes}.",
+                prior.PlanId, prior.ServiceRetainers, prior.RetainerWaitBeforeDungeonMinutes);
             return true;
         }
         if (!CanStart)
             throw new InvalidOperationException("A farming plan is already active or requires recovery.");
+        if (previousRetainerSession is { State: "Active" or "StopRequested" })
+            throw new InvalidOperationException("Stop or recover the existing combined automation session before starting a new plan.");
 
         var plan = new FarmingPlanRecord
         {
@@ -107,6 +147,10 @@ public sealed class FarmingPlanController(
             Mode = mode.ToString(),
             GearsetInspectionId = gearsetId,
             BareMode = bareMode,
+            ServiceRetainers = serviceRetainers,
+            RetainerWaitBeforeDungeonMinutes = retainerWaitMinutes,
+            FarmingCharacterName = farmingCharacterName,
+            FarmingCharacterWorld = farmingCharacterWorld,
             DungeonReward = dungeon.Reward,
             RequestedPeriodCount = periodsToUse,
             CharacterContentId = expectedCharacterContentId,
@@ -116,6 +160,7 @@ public sealed class FarmingPlanController(
         plan.WeeklyResetUtc = plan.WeekStartUtc.AddDays(7);
         plan.FinishDeadlineUtc = FarmingSchedulePolicy.GetFinishDeadlineUtc(plan.WeekStartUtc, periodsToUse);
         configuration.FarmingPlan = plan;
+        configuration.RetainerSession = CreateLinkedRetainerSession(plan, farmingCharacterName, farmingCharacterWorld, serviceRetainers);
         var archivedPrior = previousPlan is not null && previousPlan.WeekStartUtc != plan.WeekStartUtc;
         if (archivedPrior)
         {
@@ -132,6 +177,7 @@ public sealed class FarmingPlanController(
         catch (Exception error)
         {
             configuration.FarmingPlan = previousPlan;
+            configuration.RetainerSession = previousRetainerSession;
             if (archivedPrior)
                 configuration.FarmingPlanHistory.Remove(previousPlan!);
             log.Error(error, "Farming plan {PlanId} confirmation could not persist; no plan started.", plan.PlanId);
@@ -139,15 +185,32 @@ public sealed class FarmingPlanController(
         }
     }
 
-    public void RequestStop()
+    public void RequestStop(bool preserveOwnedRetainerCheckpoint = false)
     {
         var plan = Current;
         if (plan is null || plan.State is not ("PendingValidation" or "Active"))
             return;
         plan.StopRequested = true;
+        if (!preserveOwnedRetainerCheckpoint && plan.RetainerCheckpointOperationId is not null)
+            plan.RetainerCheckpointOperationId = null;
         plan.Detail = "Stop requested; no further dungeon launch will be issued.";
         if (SavePlan(plan, "stop request"))
             log.Information("Farming plan {PlanId} Stop requested.", plan.PlanId);
+    }
+
+    public bool CompleteRetainerCheckpoint(string operationId, string detail)
+    {
+        var plan = Current;
+        if (plan is null || plan.RetainerCheckpointOperationId != operationId)
+            return false;
+        plan.CompletedRetainerCheckpointOperationIds ??= [];
+        if (!plan.CompletedRetainerCheckpointOperationIds.Contains(operationId, StringComparer.Ordinal))
+            plan.CompletedRetainerCheckpointOperationIds.Add(operationId);
+        plan.RetainerCheckpointOperationId = null;
+        plan.Detail = detail;
+        plan.RetryAfterUtc = null;
+        nextRefreshUtc = DateTimeOffset.MinValue;
+        return SavePlan(plan, "complete retainer checkpoint");
     }
 
     public bool AcknowledgeRecoveryAndStop()
@@ -182,15 +245,17 @@ public sealed class FarmingPlanController(
         plan.Blocker = null;
         plan.RetryAfterUtc = null;
         plan.Detail = "Reload recovery acknowledged; plan resumed after safe run reconciliation.";
+        configuration.RetainerSession = ResumeLinkedRetainerSession(plan, plan.FarmingCharacterName,
+            plan.FarmingCharacterWorld, plan.ServiceRetainers);
         nextRefreshUtc = DateTimeOffset.MinValue;
         return SavePlan(plan, "resume after reload recovery");
     }
 
-    public void Tick()
+    public void Tick(bool externalCharacterHandoffOwns = false)
     {
         try
         {
-            TickCore();
+            TickCore(externalCharacterHandoffOwns);
         }
         catch (Exception error)
         {
@@ -204,7 +269,7 @@ public sealed class FarmingPlanController(
         }
     }
 
-    private void TickCore()
+    private void TickCore(bool externalCharacterHandoffOwns)
     {
         var plan = Current;
         if (plan is null)
@@ -217,6 +282,8 @@ public sealed class FarmingPlanController(
                 Transition(plan, "Stopped", "Plan cancelled before initialization or dispatch.");
                 return;
             }
+            if (externalCharacterHandoffOwns)
+                return;
             if (plan.RetryAfterUtc is { } startRetry && DateTimeOffset.UtcNow < startRetry)
                 return;
             Initialize(plan);
@@ -320,6 +387,10 @@ public sealed class FarmingPlanController(
             Transition(plan, "DeadlineReached", "Configured finish period reached; remaining tome work was not launched.");
             return;
         }
+        if (externalCharacterHandoffOwns)
+            return;
+        if (plan.RetainerCheckpointOperationId is not null)
+            return;
         if (DateTimeOffset.UtcNow < nextRefreshUtc || plan.RetryAfterUtc is { } retryAfter && now < retryAfter)
             return;
         nextRefreshUtc = now.Add(RefreshInterval);
@@ -571,7 +642,21 @@ public sealed class FarmingPlanController(
             return false;
         }
         if (!FarmingSchedulePolicy.ShouldCreditOperation(run.OperationId, plan.CreditedOperationIds))
+        {
+            plan.CompletedRetainerCheckpointOperationIds ??= [];
+            if (plan.ServiceRetainers && !plan.StopRequested &&
+                plan.RetainerCheckpointOperationId is null &&
+                !plan.CompletedRetainerCheckpointOperationIds.Contains(run.OperationId, StringComparer.Ordinal))
+            {
+                plan.RetainerCheckpointOperationId = run.OperationId;
+                if (!SavePlan(plan, "restore missing retainer checkpoint for credited run"))
+                {
+                    plan.RetainerCheckpointOperationId = null;
+                    return false;
+                }
+            }
             return true;
+        }
         var period = plan.Periods.FirstOrDefault(item => item.StartUtc == periodStart);
         if (period is null)
         {
@@ -582,17 +667,54 @@ public sealed class FarmingPlanController(
         plan.CreditedOperationIds.Add(run.OperationId);
         period.CreditedOperationIds.Add(run.OperationId);
         period.CompletedRuns++;
+        var createRetainerCheckpoint = plan.ServiceRetainers && !plan.StopRequested;
+        if (createRetainerCheckpoint)
+            plan.RetainerCheckpointOperationId = run.OperationId;
         plan.Detail = $"Verified run credited to period {period.StartUtc:O} ({period.CompletedRuns}/{period.AllocatedRuns}).";
         if (!SavePlan(plan, "credit verified run"))
         {
             plan.CreditedOperationIds.Remove(run.OperationId);
             period.CreditedOperationIds.Remove(run.OperationId);
             period.CompletedRuns--;
+            if (createRetainerCheckpoint)
+                plan.RetainerCheckpointOperationId = null;
             return false;
         }
         log.Information("Farming plan {PlanId} credited verified run {OperationId} once; period={PeriodStartUtc}, progress={Completed}/{Allocated}.",
             plan.PlanId, run.OperationId, period.StartUtc, period.CompletedRuns, period.AllocatedRuns);
         return true;
+    }
+
+    private static RetainerAutomationSessionRecord CreateLinkedRetainerSession(
+        FarmingPlanRecord plan, string name, string world, bool serviceRetainers) => new()
+    {
+        SessionId = plan.PlanId,
+        FarmingPlanId = plan.PlanId,
+        State = "Active",
+        Detail = serviceRetainers
+            ? "Retainer servicing is authorized as part of this confirmed farming plan."
+            : "Retainer servicing is disabled for this confirmed farming plan.",
+        FarmingCharacterContentId = plan.CharacterContentId,
+        FarmingCharacterName = name,
+        FarmingCharacterWorld = world,
+        ServiceRetainers = serviceRetainers,
+        CreatedUtc = plan.CreatedUtc,
+        ExpiresUtc = plan.WeeklyResetUtc,
+    };
+
+    private RetainerAutomationSessionRecord ResumeLinkedRetainerSession(
+        FarmingPlanRecord plan, string name, string world, bool serviceRetainers)
+    {
+        var session = configuration.RetainerSession;
+        if (session is null || session.FarmingPlanId != plan.PlanId)
+            return CreateLinkedRetainerSession(plan, name, world, serviceRetainers);
+        session.State = "Active";
+        session.StopRequested = false;
+        session.Detail = "Combined farming plan explicitly resumed; prior pass/checkpoint ledger is preserved.";
+        session.FarmingCharacterName = name;
+        session.FarmingCharacterWorld = world;
+        session.ServiceRetainers = serviceRetainers;
+        return session;
     }
 
     private void SetBlocker(FarmingPlanRecord plan, string detail, bool persist = true)

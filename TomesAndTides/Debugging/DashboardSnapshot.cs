@@ -13,4 +13,5 @@ public sealed record DashboardSnapshot(
     uint SelectedTerritory,
     DebugTests.DutyModeSelection SelectedMode,
     DebugReport? Eligibility,
-    string? Error = null);
+    string? Error = null,
+    string CharacterHomeWorld = "");
