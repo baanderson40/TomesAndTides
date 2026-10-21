@@ -8,5 +8,6 @@
   <ItemGroup>
     <Compile Include="../TomesAndTides/Debugging/EligibilityReport.cs" Link="EligibilityReport.cs" />
     <Compile Include="../TomesAndTides/Debugging/SingleRunPolicy.cs" Link="SingleRunPolicy.cs" />
+    <Compile Include="../TomesAndTides/Debugging/FarmingSchedulePolicy.cs" Link="FarmingSchedulePolicy.cs" />
   </ItemGroup>
 </Project>

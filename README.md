@@ -1,15 +1,15 @@
 # Tomes & Tides
 
-Planned Dalamud scheduler for weekly-capped tomestones, Ocean Fishing, and AutoRetainer.
+Dalamud plugin coordinating weekly-capped tome farming; Ocean Fishing and AutoRetainer are planned.
 Commands: `/tomestides`, alias `/tt` (subject to availability).
 
 ## Current stage
 
-Minimal Dalamud API 15 plugin with a themed main window, a separate Diagnostics
-window, and the Phase 1 offline reward audit. Dungeon diagnostic tests are
-read-only. A separate explicitly confirmed action can request exactly one
-AutoDuty run; no scheduler, fishing, retainer automation, automatic retry, or
-automatic duty abandonment is implemented. No tests run automatically on load.
+Dalamud API 15 plugin with themed main and Diagnostics windows, Phase 1 offline
+reward audit, an explicitly confirmed one-run action, and a manually started
+persisted weekly tome farming plan. Plan distributes dungeon runs across 1–7
+reset-aligned daily periods and uses AutoDuty one run at a time. Ocean Fishing
+and retainer automation are not implemented. No tests run automatically on load.
 
 ## Build and load the debug plugin
 
@@ -30,9 +30,18 @@ the long command remains available. The plugin installer main/config buttons als
 open the main window; its Diagnostics button opens the separate debug window.
 
 The themed main window shows cached character/tome state, independent dungeon and
-mode selections, readiness, the AutoDuty action option, and the separately
-confirmed one-run action. A shared slate/cyan ImGui theme is scoped to TT windows
-and popups; it uses standard Dalamud fonts/scaling and no added UI library.
+mode selections, readiness, the AutoDuty action option, a separately confirmed
+one-run action, and a confirmed farming plan. Configure finish within the first
+1–7 weekly periods. Periods begin at 08:00 UTC. The plan persists allocations,
+period progress, stop requests, and verified operation IDs; missed work is
+redistributed across remaining periods using fresh weekly progress. Stop blocks
+future launches and lets an active run finish safely. A stopped plan can resume
+within its original week without losing completed-period progress. Weekly reset
+or selected finish deadline expires the plan; TT does not start a new week.
+An active plan pauses on plugin reload and requires explicit recovery/resume or
+stop; uncertain launches cannot be resumed automatically.
+A shared slate/cyan ImGui theme is scoped to TT windows and popups; it uses
+standard Dalamud fonts/scaling and no added UI library.
 
 The Diagnostics window's left child pane selects tests and offers Run selected / Run all / Clear.
 The separate right child pane retains each test's timestamped snapshot, errors,
@@ -80,8 +89,16 @@ change are observed; reward attribution is marked uncertain across weekly reset
 or when the count does not increase.
 
 Lifecycle and diagnostic messages use Dalamud `IPluginLog` and are visible in
-`/xllog`. Run transitions include a persisted operation ID; full diagnostic
-reports are logged at Debug level, without logging routine framework polling.
+`/xllog`. Run and plan transitions include persisted operation/plan IDs; full
+diagnostic reports are logged at Debug level, without routine polling.
+
+The farming coordinator has not yet completed in-game period-boundary, stop,
+reload, deadline, and persistence-failure acceptance. An exact expected tome
+delta still cannot prove exclusive attribution if other activities award the
+same capped currency concurrently. Plan operation blocks automatically on
+unverified reward, ambiguous launch, character change, or unknown provider/data
+state. TT never retries an uncertain AutoDuty launch, stops AutoDuty, or abandons
+a duty.
 
 See [dungeon reward findings](docs/dungeon-rewards.md).
 
@@ -102,7 +119,7 @@ Policy tests use synthetic data. The optional local-snapshot regression test
 checks the supplied Mnemonics rewards against the adjacent CSV checkout; it
 intentionally needs updating when the reference data moves to another tome era.
 
-Eligibility policy checks (plain .NET console executable):
+Eligibility and farming-schedule policy checks (plain .NET console executable):
 
 ```sh
 dotnet run --project tests/TomesAndTides.PolicyTests.csproj

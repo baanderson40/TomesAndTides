@@ -68,7 +68,7 @@ internal static class TomesTheme
 
     public static Vector4 ForStatus(string? status) => status switch
     {
-        "Eligible" or "Completed" or "Ready" => Mint,
+        "Eligible" or "Completed" or "Ready" or "Active" => Mint,
         "Blocked" or "Unknown" or "Unavailable" => Amber,
         "Failed" or "RecoveryRequired" => Rose,
         _ => Muted,

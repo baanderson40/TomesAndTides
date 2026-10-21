@@ -31,6 +31,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly DebugWindow debugWindow;
     private readonly Configuration configuration;
     private readonly DungeonRunController dungeonRun;
+    private readonly FarmingPlanController farmingPlan;
     private readonly bool aliasRegistered;
     private DateTimeOffset nextDashboardRefreshUtc;
 
@@ -43,7 +44,11 @@ public sealed class Plugin : IDalamudPlugin
         dungeonRun = new DungeonRunController(configuration, SaveConfiguration, PluginInterface,
             Client, Objects, PlayerState, DutyState, Conditions, Log, debugTests.CheckEligibility,
             debugTests.ReadLiveTomeState);
-        mainWindow = new MainWindow(session, configuration, dungeonRun, SaveConfiguration, OpenDiagnostics, Log);
+        farmingPlan = new FarmingPlanController(configuration, SaveConfiguration, dungeonRun, PlayerState, Log,
+            debugTests.ReadLiveTomeState, debugTests.CheckEligibility,
+            territory => session.DungeonChoices.FirstOrDefault(choice => choice.Territory == territory));
+        farmingPlan.RecoverAfterReload();
+        mainWindow = new MainWindow(session, configuration, dungeonRun, farmingPlan, SaveConfiguration, OpenDiagnostics, Log);
         debugWindow = new DebugWindow(session, OpenMain);
         if (!Commands.AddHandler(MainCommand, new CommandInfo(OnCommand)
             { HelpMessage = "Open the Tomes & Tides main window." }))
@@ -80,6 +85,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnUpdate(IFramework framework)
     {
+        farmingPlan.Tick();
         dungeonRun.Tick();
         session.Tick();
         if (DateTimeOffset.UtcNow < nextDashboardRefreshUtc)

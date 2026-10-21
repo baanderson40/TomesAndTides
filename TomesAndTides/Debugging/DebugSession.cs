@@ -61,7 +61,7 @@ public sealed class DebugSession(DebugTests tests, IPluginLog log)
         }
         catch (Exception error)
         {
-            dashboardSnapshot = new DashboardSnapshot(DateTimeOffset.UtcNow, false, string.Empty,
+            dashboardSnapshot = new DashboardSnapshot(DateTimeOffset.UtcNow, false, null, string.Empty,
                 string.Empty, null, null, null, null, selectedTerritory, mode, null,
                 error.GetBaseException().Message);
             log.Debug(error, "Main-window snapshot refresh failed; unavailable values remain unknown.");

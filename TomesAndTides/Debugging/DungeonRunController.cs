@@ -32,6 +32,7 @@ public sealed class DungeonRunController : IDisposable
     private bool rewardReadFailureLogged;
     private int? lastLoggedRewardDelta;
     private int? lastPersistedRewardDelta;
+    private bool deferPlanDispatchOneUpdate;
 
     public DungeonRunController(Configuration configuration, Action save, IDalamudPluginInterface pluginInterface,
         IClientState client, IObjectTable objects, IPlayerState playerState, IDutyState dutyState,
@@ -75,7 +76,7 @@ public sealed class DungeonRunController : IDisposable
     public bool CanAcknowledge => canAcknowledgeSnapshot;
 
     /// <summary>Called by the confirmed UI action. Captures user choices; all IPC/native reads run on framework thread.</summary>
-    public void Queue(DungeonRunRequest request)
+    public DungeonRunRecord Queue(DungeonRunRequest request)
     {
         if (configuration.DungeonRun is not null)
             throw new InvalidOperationException("An existing run record must be safely acknowledged first.");
@@ -88,10 +89,13 @@ public sealed class DungeonRunController : IDisposable
             Mode = request.Mode.ToString(),
             GearsetInspectionId = request.GearsetInspectionId,
             BareMode = request.BareMode,
+            FarmingPlanId = request.FarmingPlanId,
+            FarmingPeriodStartUtc = request.FarmingPeriodStartUtc,
             ExpectedReward = request.Dungeon.Reward,
             State = "PendingValidation",
             Detail = "Explicit confirmation recorded; awaiting final framework-thread validation.",
         };
+        deferPlanDispatchOneUpdate = request.FarmingPlanId is not null;
         var run = configuration.DungeonRun!;
         try
         {
@@ -99,6 +103,7 @@ public sealed class DungeonRunController : IDisposable
             log.Information("Run {OperationId} confirmed for {Dungeon} (Territory {Territory}, CFC {Cfc}, mode {Mode}, bareMode {BareMode}, gearset inspection {GearsetId}). Other integrations must not control AutoDuty until release.",
                 OperationId(run), run.DungeonName, run.TerritoryId, run.ContentFinderConditionId,
                 run.Mode, run.BareMode, run.GearsetInspectionId);
+            return run;
         }
         catch (Exception error)
         {
@@ -119,6 +124,11 @@ public sealed class DungeonRunController : IDisposable
             switch (run.State)
             {
                 case "PendingValidation":
+                    if (run.FarmingPlanId is not null && deferPlanDispatchOneUpdate)
+                    {
+                        deferPlanDispatchOneUpdate = false;
+                        break;
+                    }
                     if (SingleRunPolicy.MayDispatch(run.State))
                         DispatchOnce(run);
                     break;
@@ -174,7 +184,30 @@ public sealed class DungeonRunController : IDisposable
         exitedUtc = null;
         dispatchedThisRuntime = false;
         waitingForExitUtc = null;
+        rewardReadFailureLogged = false;
+        lastLoggedRewardDelta = null;
+        lastPersistedRewardDelta = null;
         return true;
+    }
+
+    public bool CancelPendingPlanRun(string planId)
+    {
+        if (Current is not { State: "PendingValidation", FarmingPlanId: { } currentPlanId } run ||
+            !string.Equals(currentPlanId, planId, StringComparison.Ordinal))
+            return false;
+        configuration.DungeonRun = null;
+        try
+        {
+            save();
+            log.Information("Run {OperationId} cancelled before dispatch by farming plan Stop request.", OperationId(run));
+            return true;
+        }
+        catch (Exception error)
+        {
+            configuration.DungeonRun = run;
+            log.Error(error, "Run {OperationId} pending cancellation could not be persisted; record retained.", OperationId(run));
+            return false;
+        }
     }
 
     public void Dispose()
@@ -187,6 +220,18 @@ public sealed class DungeonRunController : IDisposable
     {
         if (!SingleRunPolicy.MayDispatch(run.State))
             return;
+        if (run.FarmingPlanId is { } planId)
+        {
+            var plan = configuration.FarmingPlan;
+            var now = DateTimeOffset.UtcNow;
+            if (plan is null || plan.PlanId != planId || plan.State != "Active" || plan.StopRequested ||
+                now >= plan.FinishDeadlineUtc || now >= plan.WeeklyResetUtc ||
+                run.FarmingPeriodStartUtc is not { } periodStart || now < periodStart || now >= periodStart.AddDays(1))
+            {
+                Fail(run, "Farming plan was stopped, expired, or left its recorded period before dispatch; no AutoDuty call was made.");
+                return;
+            }
+        }
         // First framework update after confirmation snapshots character identity. No game/IPC
         // reads are performed from the ImGui draw path.
         if (run.CharacterContentId == 0)
@@ -587,4 +632,5 @@ public sealed class DungeonRunController : IDisposable
 }
 
 public sealed record DungeonRunRequest(DebugTests.DungeonOption Dungeon, DebugTests.DutyModeSelection Mode,
-    int GearsetInspectionId, bool BareMode);
+    int GearsetInspectionId, bool BareMode, string? FarmingPlanId = null,
+    DateTimeOffset? FarmingPeriodStartUtc = null);

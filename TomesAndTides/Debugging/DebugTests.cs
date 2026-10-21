@@ -38,7 +38,7 @@ public sealed class DebugTests(
         var weeklyAcquired = inventory->GetWeeklyAcquiredTomestoneCount();
         var weeklyLimit = InventoryManager.GetLimitedTomestoneWeeklyLimit();
         var held = inventory->GetTomestoneCount(currency.ItemId);
-        if (weeklyAcquired < 0 || weeklyLimit <= 0)
+        if (weeklyAcquired < 0 || weeklyLimit <= 0 || weeklyAcquired > weeklyLimit)
             throw new InvalidOperationException($"Invalid live weekly count/cap: {weeklyAcquired}/{weeklyLimit}.");
         return new(playerState.ContentId, currency.ItemId, weeklyAcquired, weeklyLimit, held);
     }
@@ -146,17 +146,17 @@ public sealed class DebugTests(
         }
 
         if (!client.IsLoggedIn || objects.LocalPlayer is not { } player)
-            return new(captured, false, string.Empty, string.Empty, null, null, null,
+            return new(captured, false, null, string.Empty, string.Empty, null, null, null,
                 ReadAutoDutyStopped(), selectedTerritory, mode, eligibility);
 
         var currency = ResolveCurrency();
         var inventory = InventoryManager.Instance();
         if (inventory == null)
-            return new(captured, true, player.Name.ToString(), currency.Name, null, null, null,
+            return new(captured, true, playerState.ContentId, player.Name.ToString(), currency.Name, null, null, null,
                 ReadAutoDutyStopped(), selectedTerritory, mode, eligibility,
                 "InventoryManager is unavailable.");
 
-        return new(captured, true, player.Name.ToString(), currency.Name,
+        return new(captured, true, playerState.ContentId, player.Name.ToString(), currency.Name,
             inventory->GetWeeklyAcquiredTomestoneCount(), InventoryManager.GetLimitedTomestoneWeeklyLimit(),
             inventory->GetTomestoneCount(currency.ItemId), ReadAutoDutyStopped(), selectedTerritory, mode, eligibility);
     }

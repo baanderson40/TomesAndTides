@@ -92,38 +92,33 @@ allow configured termination actions to run.
 - AutoRetainer busy and Multi Mode must both be inactive before dispatch.
 - Lifecycle, validation, reward-delta, recovery, and persistence diagnostics;
   Content IDs are not written to lifecycle logs.
+- Persisted 1–7-period weekly tome plan, 08:00 UTC boundaries, period allocation,
+  missed-work redistribution, Stop/Start ledger preservation, early finish,
+  weekly expiry, and automatic one-run chaining after verified reward.
+- Main-window plan confirmation, progress/blocker view, stop-after-current-run,
+  and recovery acknowledgment.
 - In-game Clyteum Trust run verified with a +50 weekly tomestone gain.
 
 ### Gaps: planned, not implemented
 
-- Weekly session planner: 1–7 periods, early-finish period selection, required
-  run calculation, period allocations, missed-work redistribution, and
-  Tuesday reset expiry.
-- UTC period state: 08:00 UTC boundaries, wait for next boundary, completed
-  period history, and Stop/Start progress preservation.
-- Automatic dungeon coordination: Start/Stop controls, cancel before dispatch,
-  stop-after-current-run, progress/blocker display, and automatic next-run
-  validation and dispatch.
 - AutoRetainer: readiness rules, single-pass Multi Mode request, owned-pass
   observation/cleanup, and farming-character return.
 - Ocean Fishing: character selector and roster, eligible-window scheduling,
   one-voyage WahTools request, voyage/cleanup observation, and return travel.
 - Cross-activity coordination, including safe handoff ownership and priority
   when tome work and fishing windows overlap.
-- Coordinator tests for period boundaries, allocations, redistribution,
-  stop/restart, multi-run dispatch, persistence failures, character changes,
-  reset crossings, and provider handoffs.
+- Controller-level tests for persistence failures, reloads, stop boundaries,
+  and multi-run dispatch; current automated coverage tests pure UTC allocation,
+  run-count, stop/deadline, and idempotent-credit policies.
 
 ### Remaining one-run limits relevant to future coordination
 
-- Current controller is a single-operation primitive, not a farming session.
-- `Completed` means duty lifecycle ended; coordinator must additionally require
-  `RewardOutcome == Verified` before continuing tome work. Exact delta still
-  cannot prove exclusive attribution if other tome gains occur concurrently.
-- Policy tests cover reward classification, but controller-level persistence,
-  provider-failure, reset-race, and character-change scenarios lack automated
-  integration coverage.
-- Live validation of busy-state IPC and reward timing remains required in game.
+- `Completed` means duty lifecycle ended; coordinator requires
+  `RewardOutcome == Verified` before continuing. Exact delta still cannot prove
+  exclusive attribution if other tome gains occur concurrently.
+- Live period-boundary, stop, reload, deadline, and persistence-failure
+  acceptance remains required in game. Live provider compatibility also needs
+  validation.
 
-These limits block automatic chaining until coordinator policy and tests cover
-them. Current build remains an explicitly confirmed one-run tool.
+The farming coordinator is implemented but not yet fully accepted in game.
+AutoRetainer and Ocean Fishing handoffs remain unimplemented.
