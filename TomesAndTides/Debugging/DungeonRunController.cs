@@ -1,7 +1,4 @@
-using Dalamud.Game.ClientState.Conditions;
-using Dalamud.Game.DutyState;
-using Dalamud.Plugin;
-using Dalamud.Plugin.Services;
+using TomesAndTides.Integrations;
 
 namespace TomesAndTides.Debugging;
 
@@ -14,13 +11,11 @@ public sealed class DungeonRunController : IDisposable
 
     private readonly Configuration configuration;
     private readonly Action save;
-    private readonly IDalamudPluginInterface pluginInterface;
-    private readonly IClientState client;
-    private readonly IObjectTable objects;
-    private readonly IPlayerState playerState;
-    private readonly IDutyState dutyState;
-    private readonly ICondition conditions;
-    private readonly IPluginLog log;
+    private readonly IAutoDutyClient autoDuty;
+    private readonly IRetainerProvider autoRetainer;
+    private readonly IWorkflowGameState gameState;
+    private readonly IWorkflowLog log;
+    private readonly IUtcClock clock;
     private readonly Func<uint, DebugTests.DutyModeSelection, int, DebugReport> eligibility;
     private readonly Func<DebugTests.LiveTomeState> readTomeState;
     private bool startEventSeen;
@@ -34,26 +29,24 @@ public sealed class DungeonRunController : IDisposable
     private int? lastPersistedRewardDelta;
     private bool deferPlanDispatchOneUpdate;
 
-    public DungeonRunController(Configuration configuration, Action save, IDalamudPluginInterface pluginInterface,
-        IClientState client, IObjectTable objects, IPlayerState playerState, IDutyState dutyState,
-        ICondition conditions, IPluginLog log,
+    public DungeonRunController(Configuration configuration, Action save, IAutoDutyClient autoDuty,
+        IRetainerProvider autoRetainer, IWorkflowGameState gameState, IWorkflowLog log,
         Func<uint, DebugTests.DutyModeSelection, int, DebugReport> eligibility,
-        Func<DebugTests.LiveTomeState> readTomeState)
+        Func<DebugTests.LiveTomeState> readTomeState,
+        IUtcClock? clock = null)
     {
         this.configuration = configuration;
         this.save = save;
-        this.pluginInterface = pluginInterface;
-        this.client = client;
-        this.objects = objects;
-        this.playerState = playerState;
-        this.dutyState = dutyState;
-        this.conditions = conditions;
+        this.autoDuty = autoDuty;
+        this.autoRetainer = autoRetainer;
+        this.gameState = gameState;
         this.log = log;
+        this.clock = clock ?? SystemUtcClock.Instance;
         this.eligibility = eligibility;
         this.readTomeState = readTomeState;
 
-        dutyState.DutyStarted += OnDutyStarted;
-        dutyState.DutyCompleted += OnDutyCompleted;
+        gameState.DutyStarted += OnDutyStarted;
+        gameState.DutyCompleted += OnDutyCompleted;
 
         // A saved launch intent is never replayed. Reload makes its outcome uncertain.
         if (configuration.DungeonRun is { } savedRecord && string.IsNullOrWhiteSpace(savedRecord.OperationId))
@@ -141,7 +134,7 @@ public sealed class DungeonRunController : IDisposable
                     ObserveEntry(run);
                     break;
                 case "RunningDuty":
-                    if (DateTimeOffset.UtcNow - (dutyEnteredUtc ?? run.RequestedUtc) > DutyTimeout)
+                    if (clock.UtcNow - (dutyEnteredUtc ?? run.RequestedUtc) > DutyTimeout)
                         RequireRecovery(run, "Duty observation timed out. TT did not stop AutoDuty, abandon, or retry.");
                     break;
                 case "WaitingForExit":
@@ -155,7 +148,7 @@ public sealed class DungeonRunController : IDisposable
         finally
         {
             canAcknowledgeSnapshot = Current is { State: "Completed" or "Failed" or "RecoveryRequired" } &&
-                                     !dutyState.IsDutyStarted && !IsBoundByDuty() && IsAutoDutyStopped();
+                                      !gameState.IsDutyStarted && !gameState.IsBoundByDuty && IsAutoDutyStopped();
         }
     }
 
@@ -212,8 +205,8 @@ public sealed class DungeonRunController : IDisposable
 
     public void Dispose()
     {
-        dutyState.DutyStarted -= OnDutyStarted;
-        dutyState.DutyCompleted -= OnDutyCompleted;
+        gameState.DutyStarted -= OnDutyStarted;
+        gameState.DutyCompleted -= OnDutyCompleted;
     }
 
     private void DispatchOnce(DungeonRunRecord run)
@@ -223,7 +216,7 @@ public sealed class DungeonRunController : IDisposable
         if (run.FarmingPlanId is { } planId)
         {
             var plan = configuration.FarmingPlan;
-            var now = DateTimeOffset.UtcNow;
+            var now = clock.UtcNow;
             if (plan is null || plan.PlanId != planId || plan.State != "Active" || plan.StopRequested ||
                 now >= plan.FinishDeadlineUtc || now >= plan.WeeklyResetUtc ||
                 run.FarmingPeriodStartUtc is not { } periodStart || now < periodStart || now >= periodStart.AddDays(1))
@@ -236,7 +229,7 @@ public sealed class DungeonRunController : IDisposable
         // reads are performed from the ImGui draw path.
         if (run.CharacterContentId == 0)
         {
-            run.CharacterContentId = playerState.ContentId;
+            run.CharacterContentId = gameState.ContentId;
             if (!Persist(run, "character snapshot", launchMayHaveHappened: false))
                 return;
         }
@@ -245,7 +238,7 @@ public sealed class DungeonRunController : IDisposable
             Fail(run, $"Final launch check failed; no AutoDuty call was made. {idleReason}");
             return;
         }
-        if (playerState.ContentId == 0 || playerState.ContentId != run.CharacterContentId || !client.IsLoggedIn || objects.LocalPlayer is null)
+        if (gameState.ContentId == 0 || gameState.ContentId != run.CharacterContentId || !gameState.IsLoggedIn || !gameState.HasLocalPlayer)
         {
             Fail(run, "Character changed or is unavailable; no AutoDuty call was made.");
             return;
@@ -280,7 +273,7 @@ public sealed class DungeonRunController : IDisposable
             Fail(run, $"Could not capture fresh weekly tome state; no AutoDuty call was made. {error.GetBaseException().Message}");
             return;
         }
-        if (tomeState.CharacterContentId != playerState.ContentId || tomeState.WeeklyAcquired >= tomeState.WeeklyLimit)
+        if (tomeState.CharacterContentId != gameState.ContentId || tomeState.WeeklyAcquired >= tomeState.WeeklyLimit)
         {
             Fail(run, "Character changed or weekly cap is reached; no AutoDuty call was made.");
             return;
@@ -292,14 +285,14 @@ public sealed class DungeonRunController : IDisposable
             return;
         }
 
-        run.CharacterContentId = playerState.ContentId;
+        run.CharacterContentId = gameState.ContentId;
         run.ExpectedReward = expectedPayout;
         run.WeeklyAcquiredBefore = tomeState.WeeklyAcquired;
         run.WeeklyLimitAtRequest = tomeState.WeeklyLimit;
         run.CurrencyItemId = tomeState.CurrencyItemId;
         run.RewardOutcome = "Pending";
-        run.WeeklyResetUtcAtRequest = NextWeeklyResetUtc(DateTimeOffset.UtcNow);
-        run.RequestedUtc = DateTimeOffset.UtcNow;
+        run.WeeklyResetUtcAtRequest = NextWeeklyResetUtc(clock.UtcNow);
+        run.RequestedUtc = clock.UtcNow;
         log.Information("Run {OperationId} fresh launch validation passed; cappedCurrencyItem={CurrencyItem}, weekly={Weekly}/{Cap}, held={Held}/2000, expectedCapClampedPayout={Expected}.",
             OperationId(run), run.CurrencyItemId, tomeState.WeeklyAcquired, tomeState.WeeklyLimit,
             tomeState.HeldBalance, run.ExpectedReward);
@@ -315,8 +308,7 @@ public sealed class DungeonRunController : IDisposable
             // AutoDuty.Run(uint territory, int loops, bool bareMode) always sets execution mode
             // to Looping. Passing loops=0 avoids overwriting the already-verified configured count.
             // TT never calls SetConfig/PushConfigOverrides/PopConfigOverrides.
-            pluginInterface.GetIpcSubscriber<uint, int, bool, object>("AutoDuty.Run")
-                .InvokeAction(run.TerritoryId, 0, run.BareMode ?? true);
+            autoDuty.Run(run.TerritoryId, run.BareMode ?? true);
             dispatchedThisRuntime = true;
             run.State = "AwaitingDuty";
             run.Detail = $"AutoDuty.Run requested once for territory {run.TerritoryId}; bareMode={run.BareMode}. Waiting for matching duty entry.";
@@ -336,12 +328,12 @@ public sealed class DungeonRunController : IDisposable
             RequireRecovery(run, "Launch outcome is uncertain after reload; no retry.");
             return;
         }
-        if (dutyState.IsDutyStarted || startEventSeen)
+        if (gameState.IsDutyStarted || startEventSeen)
         {
-            var currentCfc = dutyState.ContentFinderCondition.RowId;
+            var currentCfc = gameState.ContentFinderConditionId;
             if (currentCfc == 0)
             {
-                if (DateTimeOffset.UtcNow - run.RequestedUtc > StartTimeout)
+                if (clock.UtcNow - run.RequestedUtc > StartTimeout)
                     RequireRecovery(run, "Duty entry was observed but its ContentFinderCondition is unavailable. No retry.");
                 return;
             }
@@ -353,7 +345,7 @@ public sealed class DungeonRunController : IDisposable
             run.DutyStarted = true;
             run.State = "RunningDuty";
             run.Detail = "Matching duty entry observed. TT will not issue stop/leave commands.";
-            dutyEnteredUtc = DateTimeOffset.UtcNow;
+            dutyEnteredUtc = clock.UtcNow;
             log.Information("Run {OperationId} entered expected duty {Dungeon} (CFC {Cfc}, Territory {Territory}).",
                 OperationId(run), run.DungeonName, run.ContentFinderConditionId, run.TerritoryId);
             Persist(run, "duty entry", launchMayHaveHappened: true);
@@ -361,36 +353,36 @@ public sealed class DungeonRunController : IDisposable
                 MoveToWaitingForExit(run);
             return;
         }
-        if (DateTimeOffset.UtcNow - run.RequestedUtc > StartTimeout)
+        if (clock.UtcNow - run.RequestedUtc > StartTimeout)
             RequireRecovery(run, "No matching duty entry observed before timeout. Inspect AutoDuty and duty state; TT will not retry.");
     }
 
     private void ObserveExit(DungeonRunRecord run)
     {
-        if (DateTimeOffset.UtcNow - (waitingForExitUtc ?? DateTimeOffset.UtcNow) > StartTimeout)
+        if (clock.UtcNow - (waitingForExitUtc ?? clock.UtcNow) > StartTimeout)
         {
             RequireRecovery(run, "Duty completion was observed, but safe territory exit and AutoDuty stop were not both confirmed. TT did not leave or stop anything.");
             return;
         }
-        if (dutyState.IsDutyStarted || IsBoundByDuty())
+        if (gameState.IsDutyStarted || gameState.IsBoundByDuty)
             return;
-        if (client.TerritoryType == run.TerritoryId || dutyState.ContentFinderCondition.RowId == run.ContentFinderConditionId)
+        if (gameState.TerritoryType == run.TerritoryId || gameState.ContentFinderConditionId == run.ContentFinderConditionId)
             return;
         if (!IsAutoDutyStopped())
             return;
 
         run.State = "WaitingForReward";
         run.Detail = "Duty completion, territory exit, and AutoDuty stopped state observed; waiting for tome count update.";
-        exitedUtc = DateTimeOffset.UtcNow;
+        exitedUtc = clock.UtcNow;
         log.Information("Run {OperationId} observed territory exit and AutoDuty stopped; awaiting weekly tome update.", OperationId(run));
         Persist(run, "duty exit", launchMayHaveHappened: true);
     }
 
     private void ObserveReward(DungeonRunRecord run)
     {
-        var resetCrossed = run.WeeklyResetUtcAtRequest is { } reset && DateTimeOffset.UtcNow >= reset;
-        var characterMatches = client.IsLoggedIn && playerState.ContentId != 0 && playerState.ContentId == run.CharacterContentId;
-        var timedOut = SingleRunPolicy.TimedOut(DateTimeOffset.UtcNow, exitedUtc ?? DateTimeOffset.UtcNow, RewardTimeout);
+        var resetCrossed = run.WeeklyResetUtcAtRequest is { } reset && clock.UtcNow >= reset;
+        var characterMatches = gameState.IsLoggedIn && gameState.ContentId != 0 && gameState.ContentId == run.CharacterContentId;
+        var timedOut = SingleRunPolicy.TimedOut(clock.UtcNow, exitedUtc ?? clock.UtcNow, RewardTimeout);
         if (resetCrossed)
         {
             FinishUnverified(run, "Weekly reset boundary passed before reward reconciliation; weekly gain cannot be verified across reset.", "reset boundary");
@@ -469,17 +461,16 @@ public sealed class DungeonRunController : IDisposable
 
     private bool IsSafeIdle(out string reason)
     {
-        if (!client.IsLoggedIn || objects.LocalPlayer is null)
+        if (!gameState.IsLoggedIn || !gameState.HasLocalPlayer)
             reason = "Character is not logged in.";
         else if (!IsAutoDutyStopped())
             reason = "AutoDuty is active or its state is unavailable.";
-        else if (dutyState.IsDutyStarted || IsBoundByDuty())
+        else if (gameState.IsDutyStarted || gameState.IsBoundByDuty)
             reason = "Character is in a duty.";
         else if (!IsAutoRetainerIdle(out var retainerReason))
             reason = retainerReason;
-        else if (conditions[ConditionFlag.InCombat] || conditions[ConditionFlag.WaitingForDutyFinder] ||
-                 conditions[ConditionFlag.BetweenAreas] || conditions[ConditionFlag.BetweenAreas51] ||
-                 conditions[ConditionFlag.Occupied])
+        else if (gameState.InCombat || gameState.WaitingForDutyFinder ||
+                 gameState.BetweenAreas || gameState.BetweenAreas51 || gameState.Occupied)
             reason = "Character is in combat, queued, transitioning, or occupied.";
         else
         {
@@ -493,8 +484,8 @@ public sealed class DungeonRunController : IDisposable
     {
         try
         {
-            var busy = pluginInterface.GetIpcSubscriber<bool>("AutoRetainer.PluginState.IsBusy").InvokeFunc();
-            var multiMode = pluginInterface.GetIpcSubscriber<bool>("AutoRetainer.PluginState.GetMultiModeStatus").InvokeFunc();
+            if (!autoRetainer.TryGetProviderState(out var busy, out var multiMode))
+                throw new InvalidOperationException("AutoRetainer provider state is unavailable.");
             reason = busy ? "AutoRetainer is busy." : multiMode ? "AutoRetainer Multi Mode is active." : string.Empty;
             return !busy && !multiMode;
         }
@@ -505,13 +496,9 @@ public sealed class DungeonRunController : IDisposable
         }
     }
 
-    private bool IsBoundByDuty() => conditions[ConditionFlag.BoundByDuty] ||
-                                    conditions[ConditionFlag.BoundByDuty56] ||
-                                    conditions[ConditionFlag.BoundByDuty95];
-
     private bool IsAutoDutyStopped()
     {
-        try { return pluginInterface.GetIpcSubscriber<bool>("AutoDuty.IsStopped").InvokeFunc(); }
+        try { return autoDuty.IsStopped(); }
         catch { return false; }
     }
 
@@ -519,7 +506,7 @@ public sealed class DungeonRunController : IDisposable
     {
         try
         {
-            value = pluginInterface.GetIpcSubscriber<string, string>("AutoDuty.GetConfig").InvokeFunc(name);
+            value = autoDuty.GetConfig(name);
             return !string.IsNullOrWhiteSpace(value);
         }
         catch { value = string.Empty; return false; }
@@ -527,7 +514,7 @@ public sealed class DungeonRunController : IDisposable
 
     private bool TryReadPath(uint territory, out bool path)
     {
-        try { path = pluginInterface.GetIpcSubscriber<uint, bool>("AutoDuty.ContentHasPath").InvokeFunc(territory); return true; }
+        try { path = autoDuty.ContentHasPath(territory); return true; }
         catch { path = false; return false; }
     }
 
@@ -537,14 +524,14 @@ public sealed class DungeonRunController : IDisposable
         run.RewardOutcome = reason == "reset boundary" ? "ResetCrossed" : "Unverified";
         run.Detail = $"Duty completed and exited; reward outcome {run.RewardOutcome}. {detail}";
         log.Warning("Run {OperationId} reward outcome={RewardOutcome}, reason={Reason}, characterMatched={CharacterMatched}, currencyItem={CurrencyItem}, before={Before}, observed={After}, delta={Delta}, expected={Expected}, cap={WeeklyCap}. {Detail}",
-            OperationId(run), run.RewardOutcome, client.IsLoggedIn && playerState.ContentId == run.CharacterContentId, run.CurrencyItemId,
+            OperationId(run), run.RewardOutcome, gameState.IsLoggedIn && gameState.ContentId == run.CharacterContentId, run.CurrencyItemId,
             run.WeeklyAcquiredBefore, run.WeeklyAcquiredAfter?.ToString() ?? "unavailable",
             run.ObservedWeeklyDelta?.ToString() ?? "unavailable",
             run.ExpectedReward, run.WeeklyLimitAtRequest, detail);
         Persist(run, "unverified reward result", launchMayHaveHappened: true);
     }
 
-    private void OnDutyStarted(IDutyStateEventArgs args)
+    private void OnDutyStarted()
     {
         var run = Current;
         if (run is null || run.State is not ("AwaitingDuty" or "RunningDuty"))
@@ -552,11 +539,11 @@ public sealed class DungeonRunController : IDisposable
         startEventSeen = true;
     }
 
-    private void OnDutyCompleted(IDutyStateEventArgs args)
+    private void OnDutyCompleted()
     {
         var run = Current;
         if (run is null || run.State is not ("AwaitingDuty" or "RunningDuty") ||
-            dutyState.ContentFinderCondition.RowId != run.ContentFinderConditionId)
+            gameState.ContentFinderConditionId != run.ContentFinderConditionId)
             return;
         run.DutyCompleted = true;
         log.Information("Run {OperationId} received duty-completed event for CFC {Cfc}.",
@@ -565,7 +552,7 @@ public sealed class DungeonRunController : IDisposable
         {
             // Completion may arrive before the next framework poll observes duty entry.
             run.DutyStarted = true;
-            dutyEnteredUtc = DateTimeOffset.UtcNow;
+            dutyEnteredUtc = clock.UtcNow;
             MoveToWaitingForExit(run);
         }
         else if (run.State == "RunningDuty")
@@ -578,7 +565,7 @@ public sealed class DungeonRunController : IDisposable
     {
         run.State = "WaitingForExit";
         run.Detail = "Duty-completed event observed. Waiting for duty-area exit and AutoDuty stopped; TT will not leave/stop anything.";
-        waitingForExitUtc = DateTimeOffset.UtcNow;
+        waitingForExitUtc = clock.UtcNow;
         Persist(run, "duty completion", launchMayHaveHappened: true);
     }
 

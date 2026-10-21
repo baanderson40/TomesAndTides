@@ -39,6 +39,7 @@ public sealed class RetainerHandoffRecord
 {
     public string HandoffId { get; set; } = string.Empty;
     public string SessionId { get; set; } = string.Empty;
+    public string? FarmingOperationId { get; set; }
     public ulong FarmingCharacterContentId { get; set; }
     public string FarmingCharacterName { get; set; } = string.Empty;
     public string FarmingCharacterWorld { get; set; } = string.Empty;

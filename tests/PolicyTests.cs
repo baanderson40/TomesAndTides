@@ -177,6 +177,24 @@ var tests = new (string Name, Action Run)[]
             Wait(60, 31) || Wait(60, 5, known: false) || Wait(60, 5, ready: true) || Wait(null, 5))
             throw new InvalidOperationException("Near-complete venture wait threshold policy mismatch.");
     }),
+    ("return verification deadline is bounded and starts at phase transition", () =>
+    {
+        var phaseChanged = new DateTimeOffset(2026, 10, 21, 12, 0, 0, TimeSpan.Zero);
+        var timeout = TimeSpan.FromMinutes(10);
+        if (RetainerHandoffPolicy.ReturnVerificationTimedOut(phaseChanged.AddMinutes(9), phaseChanged, timeout) ||
+            !RetainerHandoffPolicy.ReturnVerificationTimedOut(phaseChanged.AddMinutes(10), phaseChanged, timeout))
+            throw new InvalidOperationException("Return verification timeout boundary mismatch.");
+    }),
+    ("handoff ownership and checkpoint reconciliation require matching IDs", () =>
+    {
+        if (!RetainerHandoffPolicy.HandoffMatchesCheckpoint("session", "session", "op", "op") ||
+            RetainerHandoffPolicy.HandoffMatchesCheckpoint("other", "session", "op", "op") ||
+            RetainerHandoffPolicy.HandoffMatchesCheckpoint("session", "session", "other", "op") ||
+            !RetainerHandoffPolicy.MayReconcileCompletedCheckpoint("Completed", true, "session", "session", "op", "op") ||
+            RetainerHandoffPolicy.MayReconcileCompletedCheckpoint("RunningPass", true, "session", "session", "op", "op") ||
+            RetainerHandoffPolicy.MayReconcileCompletedCheckpoint("Completed", false, "session", "session", "op", "op"))
+            throw new InvalidOperationException("Handoff/checkpoint ownership policy mismatch.");
+    }),
 };
 
 var failures = 0;

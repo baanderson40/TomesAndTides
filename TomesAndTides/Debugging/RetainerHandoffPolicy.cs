@@ -3,6 +3,19 @@ namespace TomesAndTides.Debugging;
 /// <summary>Pure admission policy for beginning an additional AutoRetainer pass.</summary>
 public static class RetainerHandoffPolicy
 {
+    public static bool ReturnVerificationTimedOut(DateTimeOffset now, DateTimeOffset phaseChangedUtc,
+        TimeSpan timeout) => now - phaseChangedUtc >= timeout;
+
+    public static bool HandoffMatchesCheckpoint(string? handoffSessionId, string expectedSessionId,
+        string? handoffOperationId, string? checkpointOperationId) =>
+        string.Equals(handoffSessionId, expectedSessionId, StringComparison.Ordinal) &&
+        (checkpointOperationId is null || string.Equals(handoffOperationId, checkpointOperationId, StringComparison.Ordinal));
+
+    public static bool MayReconcileCompletedCheckpoint(string handoffState, bool completionEventObserved,
+        string? handoffSessionId, string expectedSessionId, string? handoffOperationId, string? checkpointOperationId) =>
+        handoffState == "Completed" && completionEventObserved && checkpointOperationId is not null &&
+        HandoffMatchesCheckpoint(handoffSessionId, expectedSessionId, handoffOperationId, checkpointOperationId);
+
     public static bool ShouldWaitForNearCompleteVenture(bool readinessKnown, bool ready, long? closestSeconds,
         int waitMinutes) => readinessKnown && !ready && waitMinutes is >= 0 and <= 30 &&
                             closestSeconds is { } seconds && seconds <= waitMinutes * 60L;

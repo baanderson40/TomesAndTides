@@ -5,7 +5,7 @@ using ECommons;
 namespace TomesAndTides.Integrations;
 
 /// <summary>Typed Lifestream IPC adapter. Calls are issued only by the framework-thread handoff controller.</summary>
-public sealed class LifestreamClient(IDalamudPluginInterface pluginInterface)
+public sealed class LifestreamClient(IDalamudPluginInterface pluginInterface) : ILifestreamProvider
 {
     private readonly ICallGateSubscriber<bool> isBusy = pluginInterface.GetIpcSubscriber<bool>("Lifestream.IsBusy");
     private readonly ICallGateSubscriber<string, string, ErrorCode> changeCharacter =

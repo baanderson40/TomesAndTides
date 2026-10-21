@@ -1,5 +1,3 @@
-using Dalamud.Game.ClientState.Conditions;
-using Dalamud.Plugin.Services;
 using TomesAndTides.Integrations;
 
 namespace TomesAndTides.Debugging;
@@ -8,19 +6,16 @@ namespace TomesAndTides.Debugging;
 public sealed class RetainerHandoffController(
     Configuration configuration,
     Action save,
-    AutoRetainerClient autoRetainer,
-    LifestreamClient lifestream,
-    IClientState client,
-    IObjectTable objects,
-    IPlayerState playerState,
-    ICondition conditions,
-    IDutyState dutyState,
+    IRetainerProvider autoRetainer,
+    ILifestreamProvider lifestream,
+    IWorkflowGameState gameState,
     DungeonRunController dungeonRun,
     FarmingPlanController farmingPlan,
     Func<RetainerReadinessSnapshot?> readReadiness,
     Func<RetainerReadinessSnapshot> refreshReadiness,
     Func<bool?> readAutoDutyStopped,
-    IPluginLog log) : IDisposable
+    IWorkflowLog log,
+    IUtcClock? clock = null) : IDisposable
 {
     private static readonly TimeSpan ProviderPollInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan StableIdleTime = TimeSpan.FromSeconds(3);
@@ -38,6 +33,7 @@ public sealed class RetainerHandoffController(
     private bool? providerBusy;
     private bool? providerActive;
     private bool? lifestreamBusy;
+    private IUtcClock Clock { get; } = clock ?? SystemUtcClock.Instance;
 
     public RetainerAutomationSessionRecord? Session => configuration.RetainerSession;
     public RetainerHandoffRecord? Handoff => configuration.RetainerHandoff;
@@ -54,6 +50,21 @@ public sealed class RetainerHandoffController(
     {
         var session = Session;
         var handoff = Handoff;
+        if (session is not null && handoff is { } completed && farmingPlan.Current is { } completedPlan &&
+            completedPlan.PlanId == session.FarmingPlanId &&
+            RetainerHandoffPolicy.MayReconcileCompletedCheckpoint(completed.State,
+                completed.CompletionEventObserved, completed.SessionId, session.SessionId,
+                completed.FarmingOperationId, completedPlan.RetainerCheckpointOperationId) &&
+            completed.FarmingOperationId is { } completedOperationId)
+        {
+            if (farmingPlan.CompleteRetainerCheckpoint(completedOperationId,
+                    "Reconciled persisted completed retainer handoff after reload; no provider request replayed."))
+                log.Information("Retainer handoff {HandoffId} checkpoint {OperationId} reconciled after reload without replay.",
+                    completed.HandoffId, completedOperationId);
+            else
+                RequireRecovery("Persisted completed handoff checkpoint could not be reconciled after reload.");
+            return;
+        }
         var activeSession = session is { State: "Active" or "StopRequested" };
         var activeHandoff = handoff is { State: not ("Completed" or "RecoveryAcknowledged") };
         if (!activeSession && !activeHandoff)
@@ -68,7 +79,7 @@ public sealed class RetainerHandoffController(
             handoff.State = "RecoveryRequired";
             handoff.RecoveryKind = "Reload";
             handoff.Detail = "Plugin reloaded during an owned handoff. AutoRetainer and Lifestream intents will not be replayed.";
-            handoff.PhaseChangedUtc = DateTimeOffset.UtcNow;
+            handoff.PhaseChangedUtc = Clock.UtcNow;
         }
         SaveOrBlock("reload recovery");
         log.Warning("Retainer session {SessionId} requires explicit reload recovery; no provider action will be replayed.", session?.SessionId ?? "unknown");
@@ -107,7 +118,7 @@ public sealed class RetainerHandoffController(
             handoff.State = "RecoveryAcknowledged";
             handoff.RecoveryKind = null;
             handoff.Detail = "User acknowledged recovery after verifying the farming character and all providers idle.";
-            handoff.PhaseChangedUtc = DateTimeOffset.UtcNow;
+            handoff.PhaseChangedUtc = Clock.UtcNow;
         }
         if (Session is { } session)
         {
@@ -144,6 +155,13 @@ public sealed class RetainerHandoffController(
             return;
         if (OwnsActivity)
         {
+            if (Handoff is not { } ownedHandoff ||
+                !RetainerHandoffPolicy.HandoffMatchesCheckpoint(ownedHandoff.SessionId, session.SessionId,
+                    ownedHandoff.FarmingOperationId, plan.RetainerCheckpointOperationId))
+            {
+                RequireRecovery("Owned retainer handoff does not match the active plan/session checkpoint; continuation is blocked.");
+                return;
+            }
             TickHandoff(session, Handoff!);
             return;
         }
@@ -154,7 +172,7 @@ public sealed class RetainerHandoffController(
         }
         if (plan.StopRequested || plan.State is "PendingValidation" or "RecoveryRequired" or "Stopped" or "Expired")
             return;
-        var now = DateTimeOffset.UtcNow;
+        var now = Clock.UtcNow;
         if (now >= session.ExpiresUtc)
         {
             SetSessionState(session, "Expired", "Weekly reset reached; no new retainer passes will start until a new explicit session.");
@@ -231,7 +249,7 @@ public sealed class RetainerHandoffController(
         var autoDuty = readAutoDutyStopped();
         if (autoDuty != true || !TryPollProviders() || providerBusy != false || providerActive != false || lifestreamBusy != false)
             return false;
-        if (!readiness.Known || !readiness.Ready || DateTimeOffset.UtcNow - readiness.CapturedUtc > ReadinessFreshness)
+        if (!readiness.Known || !readiness.Ready || Clock.UtcNow - readiness.CapturedUtc > ReadinessFreshness)
             return false;
         log.Information("Retainer handoff preflight passed for session {SessionId}; readyCharacters={ReadyCharacters}.",
             session.SessionId, readiness.ReadyCharacters);
@@ -243,7 +261,7 @@ public sealed class RetainerHandoffController(
         if (!TryGetCharacter(out var contentId, out var name, out var world) || contentId != session.FarmingCharacterContentId ||
             name != session.FarmingCharacterName || world != session.FarmingCharacterWorld)
             return;
-        var now = DateTimeOffset.UtcNow;
+        var now = Clock.UtcNow;
         var handoff = new RetainerHandoffRecord
         {
             HandoffId = Guid.NewGuid().ToString("N"),
@@ -257,6 +275,7 @@ public sealed class RetainerHandoffController(
             PhaseChangedUtc = now,
             LaunchIntentUtc = now,
             ReadinessFingerprintAtLaunch = readiness.Fingerprint,
+            FarmingOperationId = farmingPlan.Current?.RetainerCheckpointOperationId,
         };
         configuration.RetainerHandoff = handoff;
         if (!SaveOrBlock("record AutoRetainer launch intent"))
@@ -273,7 +292,7 @@ public sealed class RetainerHandoffController(
             autoRetainer.RequestSingleRetainerPass();
             handoff.State = "AwaitingStart";
             handoff.Detail = "AutoRetainer request returned; waiting for owned pass lifecycle evidence.";
-            handoff.PhaseChangedUtc = DateTimeOffset.UtcNow;
+            handoff.PhaseChangedUtc = Clock.UtcNow;
             if (!SaveOrBlock("record AutoRetainer request response"))
             {
                 RequireRecovery("AutoRetainer may have accepted the request, but the response state could not be persisted.");
@@ -289,7 +308,7 @@ public sealed class RetainerHandoffController(
 
     private void TickHandoff(RetainerAutomationSessionRecord session, RetainerHandoffRecord handoff)
     {
-        var now = DateTimeOffset.UtcNow;
+        var now = Clock.UtcNow;
         var eventObserved = Interlocked.Exchange(ref completionEventPending, 0) != 0;
         if (eventObserved)
         {
@@ -359,6 +378,11 @@ public sealed class RetainerHandoffController(
                     RequireRecovery("Farming-character return timed out; no second Lifestream request will be sent.");
                 break;
             case "VerifyingReturn":
+                if (RetainerHandoffPolicy.ReturnVerificationTimedOut(now, handoff.PhaseChangedUtc, ReturnTimeout))
+                {
+                    RequireRecovery("Return identity/safe-state verification timed out; no second Lifestream request will be sent.");
+                    break;
+                }
                 var farmingCharacterMatched = IsFarmingCharacterCurrent();
                 var playerSafe = IsSafePlayerState();
                 var autoDutyStopped = readAutoDutyStopped() == true;
@@ -380,9 +404,9 @@ public sealed class RetainerHandoffController(
 
     private void RecordReturnIntent(RetainerAutomationSessionRecord session, RetainerHandoffRecord handoff)
     {
-        handoff.ReturnIntentUtc = DateTimeOffset.UtcNow;
+        handoff.ReturnIntentUtc = Clock.UtcNow;
         handoff.State = "ReturnIntentRecorded";
-        handoff.PhaseChangedUtc = DateTimeOffset.UtcNow;
+        handoff.PhaseChangedUtc = Clock.UtcNow;
         handoff.Detail = "Return intent persisted; Lifestream will be requested once after fresh idle checks.";
         if (!PersistHandoff(handoff, "record farming-character return intent"))
             return;
@@ -396,7 +420,7 @@ public sealed class RetainerHandoffController(
             SetHandoffState(handoff, "VerifyingReturn", "Farming character already present; verifying stable safe state.");
             return;
         }
-        if (handoff.ReturnIntentUtc is { } intentAt && DateTimeOffset.UtcNow - intentAt >= ReturnTimeout)
+        if (handoff.ReturnIntentUtc is { } intentAt && Clock.UtcNow - intentAt >= ReturnTimeout)
         {
             RequireRecovery("Return preflight did not become safe before timeout; no Lifestream request was issued.");
             return;
@@ -412,14 +436,14 @@ public sealed class RetainerHandoffController(
         }
         handoff.State = "AwaitingFarmingCharacter";
         handoff.Detail = "Lifestream accepted the one-time return request; verifying farming-character identity.";
-        handoff.PhaseChangedUtc = DateTimeOffset.UtcNow;
+        handoff.PhaseChangedUtc = Clock.UtcNow;
         if (!PersistHandoff(handoff, "record Lifestream response"))
             RequireRecovery("Lifestream may have accepted the return request, but its response could not be persisted.");
     }
 
     private void CompleteHandoff(RetainerAutomationSessionRecord session, RetainerHandoffRecord handoff)
     {
-        var now = DateTimeOffset.UtcNow;
+        var now = Clock.UtcNow;
         handoff.State = "Completed";
         handoff.Detail = "Retainers-only pass completed; farming character returned and verified safe. Ownership released.";
         handoff.PhaseChangedUtc = now;
@@ -437,8 +461,13 @@ public sealed class RetainerHandoffController(
             log.Information("Retainer handoff {HandoffId} completed and credited once; session {SessionId} is {State}.",
                 handoff.HandoffId, session.SessionId, session.State);
             if (farmingPlan.Current is { RetainerCheckpointOperationId: { } operationId } plan)
-                CompleteCheckpoint(plan, operationId,
-                    "Retainer pass completed, farming character verified, and linked dungeon checkpoint cleared.");
+            {
+                if (handoff.FarmingOperationId != operationId)
+                    RequireRecovery("Completed retainer handoff does not match the persisted dungeon checkpoint; continuation is blocked.");
+                else
+                    CompleteCheckpoint(plan, operationId,
+                        "Retainer pass completed, farming character verified, and linked dungeon checkpoint cleared.");
+            }
         }
         StateChanged?.Invoke();
     }
@@ -464,13 +493,13 @@ public sealed class RetainerHandoffController(
 
     private bool TryGetCharacter(out ulong contentId, out string name, out string world)
     {
-        contentId = playerState.ContentId;
+        contentId = gameState.ContentId;
         name = string.Empty;
         world = string.Empty;
-        if (!client.IsLoggedIn || contentId == 0 || objects.LocalPlayer is not { } player)
+        if (!gameState.IsLoggedIn || contentId == 0 || !gameState.HasLocalPlayer)
             return false;
-        name = player.Name.ToString();
-        world = player.HomeWorld.Value.Name.ToString();
+        name = gameState.CharacterName;
+        world = gameState.HomeWorld;
         return !string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(world);
     }
 
@@ -479,10 +508,7 @@ public sealed class RetainerHandoffController(
         string.Equals(name, session.FarmingCharacterName, StringComparison.Ordinal) &&
         string.Equals(world, session.FarmingCharacterWorld, StringComparison.Ordinal);
 
-    private bool IsSafePlayerState() => client.IsLoggedIn && objects.LocalPlayer is { CurrentHp: > 0 } &&
-        !dutyState.IsDutyStarted && !conditions[ConditionFlag.InCombat] &&
-        !conditions[ConditionFlag.WaitingForDutyFinder] && !conditions[ConditionFlag.BetweenAreas] &&
-        !conditions[ConditionFlag.BetweenAreas51];
+    private bool IsSafePlayerState() => gameState.IsSafePlayerState;
 
     private void SetHandoffState(RetainerHandoffRecord handoff, string state, string detail)
     {
@@ -491,7 +517,7 @@ public sealed class RetainerHandoffController(
         var previous = handoff.State;
         handoff.State = state;
         handoff.Detail = detail;
-        handoff.PhaseChangedUtc = DateTimeOffset.UtcNow;
+        handoff.PhaseChangedUtc = Clock.UtcNow;
         idleSinceUtc = null;
         safeSinceUtc = null;
         if (PersistHandoff(handoff, "handoff phase transition"))
@@ -510,7 +536,7 @@ public sealed class RetainerHandoffController(
             handoff.State = "RecoveryRequired";
             handoff.RecoveryKind ??= "AmbiguousProviderOutcome";
             handoff.Detail = detail;
-            handoff.PhaseChangedUtc = DateTimeOffset.UtcNow;
+            handoff.PhaseChangedUtc = Clock.UtcNow;
             if (Session is { } session)
             {
                 session.State = "RecoveryRequired";
@@ -551,7 +577,7 @@ public sealed class RetainerHandoffController(
                 handoff.State = "RecoveryRequired";
                 handoff.RecoveryKind = "PersistenceFailure";
                 handoff.Detail = $"Persistence failed during {context}; provider work is paused for explicit recovery.";
-                handoff.PhaseChangedUtc = DateTimeOffset.UtcNow;
+                handoff.PhaseChangedUtc = Clock.UtcNow;
                 if (Session is { } session)
                 {
                     session.State = "RecoveryRequired";

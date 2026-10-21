@@ -34,29 +34,35 @@ public sealed class Plugin : IDalamudPlugin
     private readonly DungeonRunController dungeonRun;
     private readonly FarmingPlanController farmingPlan;
     private readonly AutoRetainerClient autoRetainer;
+    private readonly AutoDutyClient autoDuty;
+    private readonly DalamudWorkflowGameState gameState;
     private readonly RetainerHandoffController retainerHandoff;
     private RetainerReadinessSnapshot? retainerReadiness;
     private DateTimeOffset nextRetainerScanUtc;
     private readonly bool aliasRegistered;
     private DateTimeOffset nextDashboardRefreshUtc;
+    private readonly IWorkflowLog workflowLog;
 
     public Plugin()
     {
         var loadedUtc = DateTimeOffset.UtcNow;
         configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        workflowLog = new DalamudWorkflowLog(Log);
         autoRetainer = new AutoRetainerClient(PluginInterface, Log);
+        autoDuty = new AutoDutyClient(PluginInterface);
+        gameState = new DalamudWorkflowGameState(Client, Objects, PlayerState, Conditions, DutyState);
         var debugTests = new DebugTests(Data, Client, Objects, PluginInterface, Unlocks, PlayerState, Conditions, configuration);
         session = new DebugSession(debugTests, Log);
-        dungeonRun = new DungeonRunController(configuration, SaveConfiguration, PluginInterface,
-            Client, Objects, PlayerState, DutyState, Conditions, Log, debugTests.CheckEligibility,
+        dungeonRun = new DungeonRunController(configuration, SaveConfiguration, autoDuty, autoRetainer,
+            gameState, workflowLog, debugTests.CheckEligibility,
             debugTests.ReadLiveTomeState);
-        farmingPlan = new FarmingPlanController(configuration, SaveConfiguration, dungeonRun, PlayerState, Log,
+        farmingPlan = new FarmingPlanController(configuration, SaveConfiguration, dungeonRun, gameState, workflowLog,
             debugTests.ReadLiveTomeState, debugTests.CheckEligibility,
             territory => session.DungeonChoices.FirstOrDefault(choice => choice.Territory == territory));
         var lifestream = new LifestreamClient(PluginInterface);
         retainerHandoff = new RetainerHandoffController(configuration, SaveConfiguration, autoRetainer, lifestream,
-            Client, Objects, PlayerState, Conditions, DutyState, dungeonRun, farmingPlan,
-            () => retainerReadiness, RefreshRetainerReadiness, debugTests.ReadAutoDutyStopped, Log);
+            gameState, dungeonRun, farmingPlan,
+            () => retainerReadiness, RefreshRetainerReadiness, debugTests.ReadAutoDutyStopped, workflowLog);
         retainerHandoff.Subscribe();
         farmingPlan.RecoverAfterReload();
         retainerHandoff.RecoverAfterReload();
@@ -96,6 +102,7 @@ public sealed class Plugin : IDalamudPlugin
         dungeonRun.Dispose();
         retainerHandoff.Dispose();
         autoRetainer.Dispose();
+        gameState.Dispose();
         windows.RemoveAllWindows();
     }
 

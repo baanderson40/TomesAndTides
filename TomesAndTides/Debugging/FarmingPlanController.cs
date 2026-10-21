@@ -1,5 +1,3 @@
-using Dalamud.Plugin.Services;
-
 namespace TomesAndTides.Debugging;
 
 /// <summary>Persisted framework-thread coordinator for one bounded weekly tome plan.</summary>
@@ -7,15 +5,17 @@ public sealed class FarmingPlanController(
     Configuration configuration,
     Action save,
     DungeonRunController dungeonRun,
-    IPlayerState playerState,
-    IPluginLog log,
+    IWorkflowGameState gameState,
+    IWorkflowLog log,
     Func<DebugTests.LiveTomeState> readTomeState,
     Func<uint, DebugTests.DutyModeSelection, int, DebugReport> eligibility,
-    Func<uint, DebugTests.DungeonOption?> findDungeon)
+    Func<uint, DebugTests.DungeonOption?> findDungeon,
+    IUtcClock? clock = null)
 {
     private static readonly TimeSpan RefreshInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan BlockerRetry = TimeSpan.FromSeconds(30);
     private DateTimeOffset nextRefreshUtc;
+    private IUtcClock Clock { get; } = clock ?? SystemUtcClock.Instance;
 
     public FarmingPlanRecord? Current => configuration.FarmingPlan;
     public bool IsActive => Current is { State: "Active" or "PendingValidation" };
@@ -30,7 +30,7 @@ public sealed class FarmingPlanController(
                 return false;
             if (plan.State is not "Active")
                 return true;
-            var now = DateTimeOffset.UtcNow;
+            var now = Clock.UtcNow;
             if (plan.StopRequested || now >= plan.FinishDeadlineUtc || now >= plan.WeeklyResetUtc)
                 return true;
             var periodStart = FarmingSchedulePolicy.GetPeriodStartUtc(now, plan.WeekStartUtc);
@@ -48,9 +48,9 @@ public sealed class FarmingPlanController(
                 return true;
             if (plan.State is "Active" or "PendingValidation" or "RecoveryRequired")
                 return false;
-            var currentWeek = FarmingSchedulePolicy.GetWeekStartUtc(DateTimeOffset.UtcNow);
+            var currentWeek = FarmingSchedulePolicy.GetWeekStartUtc(Clock.UtcNow);
             if (plan.WeekStartUtc == currentWeek)
-                return plan.State == "Stopped" && DateTimeOffset.UtcNow < plan.FinishDeadlineUtc;
+                return plan.State == "Stopped" && Clock.UtcNow < plan.FinishDeadlineUtc;
             return true;
         }
     }
@@ -100,8 +100,8 @@ public sealed class FarmingPlanController(
             previousRetainerSession is { State: "RecoveryRequired" })
             throw new InvalidOperationException("Resolve the existing retainer handoff/session before starting or resuming farming.");
         if (previousPlan is { State: "Stopped" } prior &&
-            prior.WeekStartUtc == FarmingSchedulePolicy.GetWeekStartUtc(DateTimeOffset.UtcNow) &&
-            DateTimeOffset.UtcNow < prior.FinishDeadlineUtc)
+            prior.WeekStartUtc == FarmingSchedulePolicy.GetWeekStartUtc(Clock.UtcNow) &&
+            Clock.UtcNow < prior.FinishDeadlineUtc)
         {
             if (configuration.RetainerSession is { State: "Active" or "StopRequested" } legacySession &&
                 legacySession.FarmingPlanId != prior.PlanId)
@@ -154,7 +154,7 @@ public sealed class FarmingPlanController(
             DungeonReward = dungeon.Reward,
             RequestedPeriodCount = periodsToUse,
             CharacterContentId = expectedCharacterContentId,
-            CreatedUtc = DateTimeOffset.UtcNow,
+            CreatedUtc = Clock.UtcNow,
         };
         plan.WeekStartUtc = FarmingSchedulePolicy.GetWeekStartUtc(plan.CreatedUtc);
         plan.WeeklyResetUtc = plan.WeekStartUtc.AddDays(7);
@@ -284,7 +284,7 @@ public sealed class FarmingPlanController(
             }
             if (externalCharacterHandoffOwns)
                 return;
-            if (plan.RetryAfterUtc is { } startRetry && DateTimeOffset.UtcNow < startRetry)
+            if (plan.RetryAfterUtc is { } startRetry && Clock.UtcNow < startRetry)
                 return;
             Initialize(plan);
             return;
@@ -324,7 +324,7 @@ public sealed class FarmingPlanController(
             else if (run.State == "Failed")
             {
                 plan.Blocker = run.Detail;
-                plan.RetryAfterUtc = DateTimeOffset.UtcNow.Add(BlockerRetry);
+                plan.RetryAfterUtc = Clock.UtcNow.Add(BlockerRetry);
                 log.Warning("Farming plan {PlanId} launch validation blocked before dispatch; retry after {RetryUtc}: {Blocker}",
                     plan.PlanId, plan.RetryAfterUtc, plan.Blocker);
                 if (!dungeonRun.CanAcknowledge || !dungeonRun.Acknowledge())
@@ -334,7 +334,7 @@ public sealed class FarmingPlanController(
                 return;
             }
             else if (run.State == "PendingValidation" &&
-                     (plan.StopRequested || DateTimeOffset.UtcNow >= plan.FinishDeadlineUtc || DateTimeOffset.UtcNow >= plan.WeeklyResetUtc))
+                     (plan.StopRequested || Clock.UtcNow >= plan.FinishDeadlineUtc || Clock.UtcNow >= plan.WeeklyResetUtc))
             {
                 if (!dungeonRun.CancelPendingPlanRun(plan.PlanId))
                     return;
@@ -343,7 +343,7 @@ public sealed class FarmingPlanController(
                     return;
             }
             else if (run.State == "PendingValidation" && run.FarmingPeriodStartUtc is { } queuedPeriod &&
-                     FarmingSchedulePolicy.GetPeriodStartUtc(DateTimeOffset.UtcNow, plan.WeekStartUtc) != queuedPeriod)
+                     FarmingSchedulePolicy.GetPeriodStartUtc(Clock.UtcNow, plan.WeekStartUtc) != queuedPeriod)
             {
                 if (!dungeonRun.CancelPendingPlanRun(plan.PlanId))
                     return;
@@ -376,7 +376,7 @@ public sealed class FarmingPlanController(
             return;
         }
 
-        var now = DateTimeOffset.UtcNow;
+        var now = Clock.UtcNow;
         if (now >= plan.WeeklyResetUtc)
         {
             Transition(plan, "Expired", "Weekly reset reached; plan will not resume in the new week.");
@@ -391,11 +391,11 @@ public sealed class FarmingPlanController(
             return;
         if (plan.RetainerCheckpointOperationId is not null)
             return;
-        if (DateTimeOffset.UtcNow < nextRefreshUtc || plan.RetryAfterUtc is { } retryAfter && now < retryAfter)
+        if (Clock.UtcNow < nextRefreshUtc || plan.RetryAfterUtc is { } retryAfter && now < retryAfter)
             return;
         nextRefreshUtc = now.Add(RefreshInterval);
 
-        if (playerState.ContentId == 0 || playerState.ContentId != plan.CharacterContentId)
+        if (gameState.ContentId == 0 || gameState.ContentId != plan.CharacterContentId)
         {
             Transition(plan, "RecoveryRequired", "Farming character changed during the plan; no further run will launch.");
             return;
@@ -498,12 +498,12 @@ public sealed class FarmingPlanController(
 
     private void Initialize(FarmingPlanRecord plan)
     {
-        if (playerState.ContentId == 0 || playerState.ContentId != plan.CharacterContentId)
+        if (gameState.ContentId == 0 || gameState.ContentId != plan.CharacterContentId)
         {
             Transition(plan, "Stopped", "Start validation failed: farming character unavailable or changed.");
             return;
         }
-        var now = DateTimeOffset.UtcNow;
+        var now = Clock.UtcNow;
         var weekStart = plan.WeekStartUtc;
         var reset = plan.WeeklyResetUtc;
         if (FarmingSchedulePolicy.GetWeekStartUtc(now) != weekStart || now >= reset)
@@ -723,7 +723,7 @@ public sealed class FarmingPlanController(
             return;
         plan.Blocker = detail;
         plan.Detail = detail;
-        plan.RetryAfterUtc = DateTimeOffset.UtcNow.Add(BlockerRetry);
+        plan.RetryAfterUtc = Clock.UtcNow.Add(BlockerRetry);
         log.Warning("Farming plan {PlanId} blocked; reevaluate after {RetryUtc}: {Blocker}",
             plan.PlanId, plan.RetryAfterUtc, detail);
         if (persist)

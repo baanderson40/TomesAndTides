@@ -4,6 +4,7 @@ using System.Text;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Ipc;
 using Dalamud.Plugin.Services;
+using TomesAndTides.Debugging;
 
 namespace TomesAndTides.Integrations;
 
@@ -20,7 +21,7 @@ public sealed record RetainerReadinessSnapshot(
     string Fingerprint);
 
 /// <summary>AutoRetainer IPC boundary. All methods are called on framework updates.</summary>
-public sealed class AutoRetainerClient : IDisposable
+public sealed class AutoRetainerClient : IRetainerProvider, IDisposable
 {
     private readonly ICallGateSubscriber<List<ulong>> registeredCharacters;
     private readonly ICallGateSubscriber<ulong, object> offlineCharacterData;
@@ -32,6 +33,7 @@ public sealed class AutoRetainerClient : IDisposable
     private readonly ICallGateSubscriber<int?, object> enableSingleMultiMode;
     private readonly ICallGateSubscriber<object> singleMultiModeFinished;
     private readonly IPluginLog log;
+    private readonly IUtcClock clock;
     private string? lastReadinessError;
     private string? lastReadinessState;
 
@@ -54,9 +56,10 @@ public sealed class AutoRetainerClient : IDisposable
         public long? VentureEndsAt { get; set; }
     }
 
-    public AutoRetainerClient(IDalamudPluginInterface pluginInterface, IPluginLog log)
+    public AutoRetainerClient(IDalamudPluginInterface pluginInterface, IPluginLog log, IUtcClock? clock = null)
     {
         this.log = log;
+        this.clock = clock ?? SystemUtcClock.Instance;
         registeredCharacters = pluginInterface.GetIpcSubscriber<List<ulong>>("AutoRetainer.GetRegisteredCIDs");
         offlineCharacterData = pluginInterface.GetIpcSubscriber<ulong, object>("AutoRetainer.GetOfflineCharacterData");
         enabledRetainers = pluginInterface.GetIpcSubscriber<Dictionary<ulong, HashSet<string>>>("AutoRetainer.PluginState.GetEnabledRetainers");
@@ -89,7 +92,7 @@ public sealed class AutoRetainerClient : IDisposable
 
     public RetainerReadinessSnapshot ReadReadiness(ulong currentCharacterContentId = 0)
     {
-        var captured = DateTimeOffset.UtcNow;
+        var captured = clock.UtcNow;
         try
         {
             var characters = registeredCharacters.InvokeFunc() ?? throw new InvalidOperationException("AutoRetainer returned no character roster.");
@@ -170,9 +173,9 @@ public sealed class AutoRetainerClient : IDisposable
 
     private void OnSinglePassFinished() => SinglePassFinished?.Invoke();
 
-    private static List<long> ReadVentureRemaining(IEnumerable<OfflineRetainerDto> retainers, IReadOnlySet<string> selectedNames)
+    private List<long> ReadVentureRemaining(IEnumerable<OfflineRetainerDto> retainers, IReadOnlySet<string> selectedNames)
     {
-        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var now = clock.UtcNow.ToUnixTimeSeconds();
         var result = new List<long>();
         foreach (var retainer in retainers)
         {
