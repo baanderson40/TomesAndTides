@@ -4,13 +4,14 @@ namespace TomesAndTides;
 
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 3;
+    public int Version { get; set; } = 4;
     public bool EnableAutoDutyLoopActions { get; set; }
     public uint MainSelectedTerritory { get; set; }
     public int MainSelectedDutyMode { get; set; }
     public int FarmingPeriodsToUse { get; set; } = 7;
     public bool MonitorRetainerVentures { get; set; }
     public int RetainerWaitBeforeDungeonMinutes { get; set; } = 5;
+    public string ThemePreset { get; set; } = "Deep Ocean";
     public bool OceanFishingEnabled { get; set; }
     public int OceanFishingPreparationLeadMinutes { get; set; } = 15;
     public string OceanFishingCharacterMode { get; set; } = "CurrentCharacter";

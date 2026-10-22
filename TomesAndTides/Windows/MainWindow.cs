@@ -23,7 +23,6 @@ public sealed class MainWindow : Window
     private readonly AutomationSessionController automationSession;
     private readonly OceanFishingHandoffController oceanFishing;
     private readonly Func<(bool Known, IReadOnlyList<RetainerCharacterIdentity> Characters)> readRetainerRoster;
-    private bool confirmStandaloneAutomation;
     private bool confirmFarming;
     private DebugTests.DungeonOption? confirmedFarmingDungeon;
     private DebugTests.DutyModeSelection confirmedFarmingMode;
@@ -32,6 +31,7 @@ public sealed class MainWindow : Window
     private bool confirmedServiceRetainers;
     private int confirmedRetainerWaitMinutes;
     private bool confirmedIsResume;
+    private bool confirmedProviderOnly;
     private string? actionMessage;
 
     public bool AliasAvailable { get; set; }
@@ -56,6 +56,7 @@ public sealed class MainWindow : Window
         this.automationSession = automationSession;
         this.oceanFishing = oceanFishing;
         this.readRetainerRoster = readRetainerRoster;
+        TomesTheme.SetPreset(configuration.ThemePreset);
         TitleBarButtons.Add(new TitleBarButton
         {
             Icon = FontAwesomeIcon.Bug,
@@ -135,6 +136,11 @@ public sealed class MainWindow : Window
             if (ImGui.BeginTabItem("Ocean Fishing"))
             {
                 DrawOceanFishingPanel();
+                ImGui.EndTabItem();
+            }
+            if (ImGui.BeginTabItem("Settings"))
+            {
+                DrawSettingsPanel();
                 ImGui.EndTabItem();
             }
             ImGui.EndTabBar();
@@ -405,56 +411,81 @@ public sealed class MainWindow : Window
                 TextDisabledWrapped("Plan is awaiting recovery; use the Farming Plan tab to review recovery options.");
             return;
         }
+        if (automationSession.Current is { State: "Active" or "StopRequested" } activeSession)
+        {
+            TextColoredWrapped(TomesTheme.ForStatus(activeSession.State), $"Automation session: {activeSession.State}");
+            ImGui.TextWrapped(activeSession.Detail);
+            if (activeSession.State == "Active" && ImGui.Button("Stop automation", new Vector2(-1, 0)))
+                retainerHandoff.RequestStop();
+            return;
+        }
         var resumeCurrentWeek = plan is { State: "Stopped" } &&
                                 plan.WeekStartUtc == FarmingSchedulePolicy.GetWeekStartUtc(DateTimeOffset.UtcNow);
+        var resumePlan = resumeCurrentWeek && DateTimeOffset.UtcNow < plan!.FinishDeadlineUtc;
         var territory = configuration.MainSelectedTerritory;
-        if (resumeCurrentWeek)
+        if (resumePlan)
             territory = plan!.TerritoryId;
         var dungeon = session.DungeonChoices.FirstOrDefault(choice => choice.Territory == territory) ??
-                      (resumeCurrentWeek ? null : session.DungeonChoices.FirstOrDefault());
-        var modeIndex = resumeCurrentWeek && Enum.TryParse<DebugTests.DutyModeSelection>(plan!.Mode, out var savedMode)
+                      (resumePlan ? null : session.DungeonChoices.FirstOrDefault());
+        var modeIndex = resumePlan && Enum.TryParse<DebugTests.DutyModeSelection>(plan!.Mode, out var savedMode)
             ? (int)savedMode
             : Math.Clamp(configuration.MainSelectedDutyMode, 0, 1);
-        var finishPeriods = resumeCurrentWeek ? plan!.RequestedPeriodCount : Math.Clamp(configuration.FarmingPeriodsToUse, 1, 7);
+        var finishPeriods = resumePlan ? plan!.RequestedPeriodCount : Math.Clamp(configuration.FarmingPeriodsToUse, 1, 7);
         var finishBoundary = FarmingSchedulePolicy.GetWeekStartUtc(DateTimeOffset.UtcNow).AddDays(finishPeriods);
         var snapshot = session.Dashboard;
-        var selectedBareMode = resumeCurrentWeek ? plan!.BareMode : SingleRunPolicy.BareModeFor(configuration.EnableAutoDutyLoopActions);
-        ImGui.TextWrapped($"Selected: {dungeon?.Name ?? "Unavailable"} · {(DebugTests.DutyModeSelection)modeIndex} · {finishPeriods} period(s)");
-        TextDisabledWrapped($"Finish deadline: {finishBoundary.ToLocalTime():f}");
-        var readinessMatches = resumeCurrentWeek
+        var selectedBareMode = resumePlan ? plan!.BareMode : SingleRunPolicy.BareModeFor(configuration.EnableAutoDutyLoopActions);
+        var readinessMatches = resumePlan
             ? snapshot is { LoggedIn: true } && snapshot.CharacterContentId == plan!.CharacterContentId && DateTimeOffset.UtcNow < plan.FinishDeadlineUtc
             : snapshot is { LoggedIn: true, CharacterContentId: not null } &&
               DateTimeOffset.UtcNow < finishBoundary &&
               snapshot.Eligibility?.Status == "Eligible" &&
               snapshot.SelectedTerritory == dungeon?.Territory &&
               snapshot.SelectedMode == (DebugTests.DutyModeSelection)modeIndex;
-        ImGui.BeginDisabled(dungeon is null || !readinessMatches || !farmingPlan.CanStart || dungeonRun.Current is not null || retainerHandoff.OwnsActivity);
-        if (ImGui.Button(resumeCurrentWeek ? "Resume farming…" : "Start farming…", new Vector2(-1, 0)))
+        var canStartProvidersOnly = snapshot is { LoggedIn: true, CharacterContentId: not null } &&
+                                    (configuration.OceanFishingEnabled || configuration.MonitorRetainerVentures) &&
+                                    (configuration.OceanFishingCharacterMode != "SelectedCharacter" ||
+                                     configuration.OceanFishingCharacterContentId != 0 &&
+                                     !string.IsNullOrWhiteSpace(configuration.OceanFishingCharacterName) &&
+                                     !string.IsNullOrWhiteSpace(configuration.OceanFishingCharacterWorld)) &&
+                                    (plan is null || plan.State is "Stopped" or "Expired" or "RecoveryAcknowledged") &&
+                                    (automationSession.Current is null or { State: "Stopped" });
+        var canStartDungeonPlan = dungeon is not null && readinessMatches && farmingPlan.CanStart;
+        var canStartFullFlow = (canStartDungeonPlan || canStartProvidersOnly) &&
+                               dungeonRun.Current is null && !retainerHandoff.OwnsActivity && !oceanFishing.OwnsActivity;
+        var willResumePlan = resumePlan && canStartDungeonPlan;
+        ImGui.TextWrapped(willResumePlan
+            ? $"Resume weekly plan: {dungeon?.Name ?? "Unavailable"} · {(DebugTests.DutyModeSelection)modeIndex} · {finishPeriods} period(s)"
+            : canStartDungeonPlan
+                ? $"Dungeon plan: {dungeon!.Name} · {(DebugTests.DutyModeSelection)modeIndex} · {finishPeriods} period(s)"
+                : "Provider automation: Ocean Fishing and/or retainers; no dungeon plan will be started.");
+        if (canStartDungeonPlan || willResumePlan)
+            TextDisabledWrapped($"Finish deadline: {finishBoundary.ToLocalTime():f}");
+        ImGui.BeginDisabled(!canStartFullFlow);
+        if (ImGui.Button(willResumePlan ? "Resume full automation…" : "Start full automation…", new Vector2(-1, 0)))
         {
-            confirmedFarmingDungeon = dungeon;
+            confirmedProviderOnly = !canStartDungeonPlan;
+            confirmedFarmingDungeon = confirmedProviderOnly ? null : dungeon;
             confirmedFarmingMode = (DebugTests.DutyModeSelection)modeIndex;
             confirmedFarmingBareMode = selectedBareMode;
             confirmedFarmingPeriods = finishPeriods;
             confirmedServiceRetainers = configuration.MonitorRetainerVentures;
             confirmedRetainerWaitMinutes = Math.Clamp(configuration.RetainerWaitBeforeDungeonMinutes, 0, 30);
-            confirmedIsResume = resumeCurrentWeek;
+            confirmedIsResume = willResumePlan;
             confirmFarming = true;
-            ImGui.OpenPopup("Confirm weekly tome farming plan");
+            ImGui.OpenPopup("Confirm full automation");
         }
         ImGui.EndDisabled();
-        if (dungeon is null)
-            TextColoredWrapped(TomesTheme.Amber, "Cannot start: no dungeon is available yet.");
-        else if (!farmingPlan.CanStart)
+        if (!configuration.OceanFishingEnabled && !configuration.MonitorRetainerVentures && !canStartDungeonPlan && !resumePlan)
+            TextColoredWrapped(TomesTheme.Amber, "Enable Ocean Fishing, retainer service, or a ready dungeon plan to start automation.");
+        else if (resumeCurrentWeek && !resumePlan && !canStartProvidersOnly)
+            TextColoredWrapped(TomesTheme.Amber, "The weekly plan deadline passed. A provider-only session can still be started when Ocean Fishing or retainer service is enabled.");
+        else if (!canStartDungeonPlan && !canStartProvidersOnly && !resumePlan)
+            TextDisabledWrapped("Dungeon farming is unavailable or capped. Provider automation can still run through weekly reset when enabled.");
+        if (!farmingPlan.CanStart && !canStartProvidersOnly && !resumePlan)
             TextColoredWrapped(TomesTheme.Amber, plan is { State: "Stopped" }
-                ? "Cannot resume: this plan's finish deadline has passed."
+                ? "Cannot start another dungeon plan while this week's stopped plan is still resumable."
                 : "Cannot start while another plan is active or requires recovery.");
-        else if (retainerHandoff.OwnsActivity)
-            TextColoredWrapped(TomesTheme.Amber, "Cannot start while an AutoRetainer handoff owns character activity.");
-        else if (dungeonRun.Current is not null)
-            TextColoredWrapped(TomesTheme.Amber, "Cannot start while a dungeon operation is unresolved.");
-        else if (!readinessMatches)
-            TextDisabledWrapped("Start is waiting for a fresh Eligible snapshot for the selected dungeon and mode.");
-        if (DateTimeOffset.UtcNow >= finishBoundary)
+        if (canStartDungeonPlan && DateTimeOffset.UtcNow >= finishBoundary)
             TextColoredWrapped(TomesTheme.Amber, "Selected finish boundary has passed for this week.");
     }
 
@@ -541,6 +572,7 @@ public sealed class MainWindow : Window
         ImGui.Separator();
         ImGui.TextWrapped("OCEAN FISHING HANDOFF");
         ImGui.TextWrapped("Priority is Ocean Fishing → retainers → dungeon. WahTools manages route selection and movement; TT selects the character, requests one voyage per window, observes cleanup, and returns to the farming character.");
+        TextDisabledWrapped("Start and confirm Ocean Fishing as part of full automation from Current Character. Fishing can run without a dungeon plan and continues after cap/reset until Stop.");
         var enabled = configuration.OceanFishingEnabled;
         if (ImGui.Checkbox("Enable Ocean Fishing in the next automation session", ref enabled))
             SavePreference(() => configuration.OceanFishingEnabled = enabled, () => configuration.OceanFishingEnabled = !enabled,
@@ -623,85 +655,6 @@ public sealed class MainWindow : Window
         else
             TextDisabledWrapped($"WahTools: {(configuration.AutomationSession is { OceanFishingEnabled: true } ? "waiting for eligible window" : "not authorized in current session")}");
 
-        if (automationSession.Current is { State: "Active" or "StopRequested" } parent)
-        {
-            ImGui.Separator();
-            TextColoredWrapped(TomesTheme.ForStatus(parent.State), $"Automation session: {parent.State}");
-            ImGui.TextWrapped(parent.Detail);
-            if (parent.State == "Active" && ImGui.Button("Stop all automation", new Vector2(-1, 0)))
-                retainerHandoff.RequestStop();
-        }
-        else if (automationSession.NeedsRecovery)
-        {
-            TextColoredWrapped(TomesTheme.Rose, "Automation recovery required; no new provider requests will be issued.");
-            ImGui.TextWrapped(automationSession.Current?.Detail ?? "Inspect the saved operation before resuming.");
-            if (oceanFishing.NeedsRecovery && ImGui.Button("Acknowledge safe state and stop session", new Vector2(-1, 0)))
-                actionMessage = oceanFishing.AcknowledgeRecoveryAndStop()
-                    ? "Recovery acknowledged. Start a new session explicitly when ready."
-                    : "Recovery remains blocked: verify the farming character, safe state, AutoDuty, Lifestream, AutoRetainer, and WahTools cleanup.";
-        }
-        else
-        {
-            var snapshot = session.Dashboard;
-            var selectedValid = configuration.OceanFishingCharacterMode != "SelectedCharacter" ||
-                configuration.OceanFishingCharacterContentId != 0 &&
-                !string.IsNullOrWhiteSpace(configuration.OceanFishingCharacterName) &&
-                !string.IsNullOrWhiteSpace(configuration.OceanFishingCharacterWorld);
-            ImGui.BeginDisabled(snapshot is not { LoggedIn: true, CharacterContentId: not null } ||
-                                !configuration.MonitorRetainerVentures && !configuration.OceanFishingEnabled || !selectedValid);
-            if (ImGui.Button("Start fishing / retainer session…", new Vector2(-1, 0)))
-            {
-                confirmStandaloneAutomation = true;
-                ImGui.OpenPopup("Confirm automation session");
-            }
-            ImGui.EndDisabled();
-            if (snapshot is not { LoggedIn: true, CharacterContentId: not null })
-                TextDisabledWrapped("Log in and wait for a fresh farming-character snapshot before starting an automation session.");
-            else if (!configuration.MonitorRetainerVentures && !configuration.OceanFishingEnabled)
-                TextDisabledWrapped("Enable Ocean Fishing or retainer servicing before starting a session.");
-        }
-        DrawStandaloneAutomationConfirmation();
-    }
-
-    private void DrawStandaloneAutomationConfirmation()
-    {
-        if (!confirmStandaloneAutomation || !ImGui.BeginPopupModal("Confirm automation session", ref confirmStandaloneAutomation,
-                ImGuiWindowFlags.AlwaysAutoResize))
-            return;
-        var snapshot = session.Dashboard;
-        ImGui.TextWrapped($"Farming character: {snapshot?.CharacterName}@{snapshot?.CharacterHomeWorld}");
-        ImGui.TextWrapped($"Ocean Fishing: {(configuration.OceanFishingEnabled ? "enabled" : "disabled")} · preparation lead {Math.Clamp(configuration.OceanFishingPreparationLeadMinutes, 0, 45)} minutes.");
-        ImGui.TextWrapped($"Fishing character: {(configuration.OceanFishingCharacterMode == "CurrentCharacter" ? "farming character" : $"{configuration.OceanFishingCharacterName}@{configuration.OceanFishingCharacterWorld}")}");
-        ImGui.TextWrapped($"Retainer servicing: {(configuration.MonitorRetainerVentures ? "enabled" : "disabled")} · wait {Math.Clamp(configuration.RetainerWaitBeforeDungeonMinutes, 0, 30)} minutes.");
-        var linkedPlan = farmingPlan.Current is { State: "Active" } activePlan ? activePlan.PlanId : null;
-        ImGui.TextWrapped(linkedPlan is null
-            ? "No dungeon plan is attached. Fishing and retainers may continue until Stop."
-            : "The existing confirmed dungeon plan is attached; its daily allocations may run while fishing and retainers continue until Stop.");
-        ImGui.TextWrapped("Fishing has priority over retainers and dungeons. WahTools AutoOcean(false) is used before CatchTheBoat; TT will not retry an ambiguous launch. Weekly reset expires dungeon authorization only. A new weekly dungeon plan requires confirmation.");
-        if (ImGui.Button("Confirm session"))
-        {
-            try
-            {
-                if (snapshot?.CharacterContentId is not { } contentId || contentId == 0)
-                    throw new InvalidOperationException("Farming character identity unavailable.");
-                automationSession.StartOrResume(contentId, snapshot.CharacterName, snapshot.CharacterHomeWorld,
-                    configuration.MonitorRetainerVentures, Math.Clamp(configuration.RetainerWaitBeforeDungeonMinutes, 0, 30),
-                    configuration.OceanFishingEnabled, Math.Clamp(configuration.OceanFishingPreparationLeadMinutes, 0, 45),
-                    configuration.OceanFishingCharacterMode, configuration.OceanFishingCharacterContentId,
-                    configuration.OceanFishingCharacterName, configuration.OceanFishingCharacterWorld, linkedPlan);
-                actionMessage = "Automation session confirmed. Activity will be admitted in fishing → retainers → dungeon order.";
-            }
-            catch (Exception error) { actionMessage = error.Message; }
-            confirmStandaloneAutomation = false;
-            ImGui.CloseCurrentPopup();
-        }
-        ImGui.SameLine();
-        if (ImGui.Button("Cancel"))
-        {
-            confirmStandaloneAutomation = false;
-            ImGui.CloseCurrentPopup();
-        }
-        ImGui.EndPopup();
     }
 
     private void SavePreference(Action apply, Action rollback, string description)
@@ -715,21 +668,72 @@ public sealed class MainWindow : Window
         }
     }
 
+    private void DrawSettingsPanel()
+    {
+        ImGui.Separator();
+        ImGui.TextWrapped("SETTINGS");
+        ImGui.TextWrapped("Choose a coordinated accent and window palette. This selection applies to the main and diagnostics windows.");
+        var presetIndex = Array.IndexOf(TomesTheme.PresetNames, TomesTheme.CurrentPreset);
+        if (presetIndex < 0)
+            presetIndex = 0;
+        ImGui.SetNextItemWidth(300f * TomesTheme.Scale);
+        if (ImGui.Combo("Color theme", ref presetIndex, TomesTheme.PresetNames, TomesTheme.PresetNames.Length))
+        {
+            var previous = configuration.ThemePreset;
+            configuration.ThemePreset = TomesTheme.PresetNames[presetIndex];
+            TomesTheme.SetPreset(configuration.ThemePreset);
+            try { saveConfiguration(); }
+            catch (Exception error)
+            {
+                configuration.ThemePreset = previous;
+                TomesTheme.SetPreset(previous);
+                actionMessage = $"Could not save color theme: {error.Message}";
+            }
+        }
+        ImGui.Spacing();
+        ImGui.TextWrapped($"Selected: {TomesTheme.CurrentPreset}");
+        TextColoredWrapped(TomesTheme.Cyan, "Accent preview");
+        ImGui.TextWrapped("Window background preview");
+        ImGui.PushStyleColor(ImGuiCol.ChildBg, TomesTheme.Window);
+        if (ImGui.BeginChild("WindowColorPreview", new Vector2(300f * TomesTheme.Scale, 90f * TomesTheme.Scale), true))
+        {
+            TextColoredWrapped(TomesTheme.Cyan, "Selected controls and highlights");
+            TextColoredWrapped(TomesTheme.Text, "Readable foreground text");
+        }
+        ImGui.EndChild();
+        ImGui.PopStyleColor();
+        TextDisabledWrapped("Fiery Ocean, Dark Sunset, and Summer Fun coordinate window, panel, border, and accent colors. Warning, success, and error colors remain distinct.");
+        if (!string.IsNullOrWhiteSpace(actionMessage))
+            TextColoredWrapped(TomesTheme.Amber, actionMessage);
+    }
+
     private void DrawFarmingConfirmation()
     {
-        if (!confirmFarming || !ImGui.BeginPopupModal("Confirm weekly tome farming plan", ref confirmFarming,
+        if (!confirmFarming || !ImGui.BeginPopupModal("Confirm full automation", ref confirmFarming,
                 ImGuiWindowFlags.AlwaysAutoResize))
             return;
-        var dungeon = confirmedFarmingDungeon!;
+        var dungeon = confirmedFarmingDungeon;
         var snapshot = session.Dashboard;
-        var remaining = snapshot?.WeeklyAcquired is { } acquired && snapshot.WeeklyLimit is { } limit
+        var remaining = dungeon is not null && snapshot?.WeeklyAcquired is { } acquired && snapshot.WeeklyLimit is { } limit
             ? Math.Max(0, limit - acquired)
             : (int?)null;
-        var runs = remaining is { } amount ? (int)Math.Ceiling(amount / (double)dungeon.Reward) : (int?)null;
+        var runs = remaining is { } amount && dungeon is not null ? (int)Math.Ceiling(amount / (double)dungeon.Reward) : (int?)null;
         var serviceRetainers = confirmedServiceRetainers;
         var weekStart = FarmingSchedulePolicy.GetWeekStartUtc(DateTimeOffset.UtcNow);
         var finishBoundary = weekStart.AddDays(confirmedFarmingPeriods);
-        ImGui.TextWrapped($"Dungeon: {dungeon.Name}\nMode: {confirmedFarmingMode}\nExpected reward: {dungeon.Reward}\nPeriods: {confirmedFarmingPeriods}\nEstimated runs: {runs?.ToString() ?? "unavailable"}\nFinish deadline: {FarmingSchedulePolicy.GetWeekStartUtc(DateTimeOffset.UtcNow).AddDays(confirmedFarmingPeriods).ToLocalTime():f}\nbareMode: {confirmedFarmingBareMode}");
+        if (confirmedProviderOnly)
+        {
+            ImGui.TextWrapped("No weekly dungeon plan will be created. This session can service retainers and/or run Ocean Fishing until you press Stop.");
+            if (snapshot?.WeeklyAcquired is { } capped && snapshot.WeeklyLimit is { } weeklyLimit && capped >= weeklyLimit)
+                TextColoredWrapped(TomesTheme.Amber, "Weekly tome cap reached. Fishing and retainer automation remain enabled and can continue through the weekly reset.");
+            else
+                TextDisabledWrapped("Dungeon farming is unavailable or not selected. Provider automation will continue independently until Stop.");
+        }
+        else if (dungeon is not null)
+        {
+            ImGui.TextWrapped($"Dungeon: {dungeon.Name}\nMode: {confirmedFarmingMode}\nExpected reward: {dungeon.Reward}\nPeriods: {confirmedFarmingPeriods}\nEstimated runs: {runs?.ToString() ?? "unavailable"}\nFinish deadline: {finishBoundary.ToLocalTime():f}\nbareMode: {confirmedFarmingBareMode}");
+        }
+        ImGui.TextWrapped($"Ocean Fishing: {(configuration.OceanFishingEnabled ? "enabled" : "disabled")} · preparation lead {Math.Clamp(configuration.OceanFishingPreparationLeadMinutes, 0, 45)} minutes · character {(configuration.OceanFishingCharacterMode == "CurrentCharacter" ? "farming character" : $"{configuration.OceanFishingCharacterName}@{configuration.OceanFishingCharacterWorld}")}.");
         ImGui.TextWrapped($"Retainer service: {(serviceRetainers ? "enabled" : "disabled")} · near-complete wait: {confirmedRetainerWaitMinutes} minute(s).");
         if (confirmedIsResume && farmingPlan.Current is { } priorPlan)
         {
@@ -740,32 +744,52 @@ public sealed class MainWindow : Window
             if (period is not null && period.CompletedRuns >= period.AllocatedRuns)
                 ImGui.TextWrapped("This period is complete: no additional dungeon runs will launch before the next period; enabled retainer servicing may continue.");
         }
-        if (runs is { } count && DateTimeOffset.UtcNow < finishBoundary)
+        if (!confirmedProviderOnly && runs is { } count && DateTimeOffset.UtcNow < finishBoundary)
         {
             var firstPeriod = FarmingSchedulePolicy.GetPeriodStartUtc(DateTimeOffset.UtcNow, weekStart);
             var preview = FarmingSchedulePolicy.CreatePeriods(firstPeriod, finishBoundary, count);
             ImGui.TextWrapped("Run allocation: " + string.Join(" · ", preview.Select(period =>
                 $"{period.StartUtc.ToLocalTime():ddd HH:mm} {period.AllocatedRuns}")));
         }
-        else if (DateTimeOffset.UtcNow >= finishBoundary)
+        else if (!confirmedProviderOnly && DateTimeOffset.UtcNow >= finishBoundary)
             TextColoredWrapped(TomesTheme.Amber, "Finish boundary already passed; plan cannot start this week.");
-        ImGui.TextWrapped("TT will distribute runs across reset-aligned 08:00 UTC periods, validate before every launch, and continue only after verified reward and safe exit. After each verified dungeon, TT checks ventures and may complete one Retainers-only pass and return before the next dungeon. Stop prevents new work; owned activity and return cleanup settle safely.");
-        ImGui.TextWrapped("AutoDuty ownership is exclusive by user convention: keep other integrations from controlling it or pushing overrides until TT releases each run.");
-        if (!confirmedFarmingBareMode)
+        if (confirmedProviderOnly)
+            ImGui.TextWrapped("Priority is Ocean Fishing → retainers → dungeon. This session has no dungeon plan; weekly reset will not create one automatically. Start a new dungeon plan explicitly when ready. Stop prevents new work and lets owned activity settle safely.");
+        else
+        {
+            ImGui.TextWrapped("TT will distribute runs across reset-aligned 08:00 UTC periods, validate before every launch, and continue only after verified reward and safe exit. After each verified dungeon, TT checks ventures and may complete one Retainers-only pass and return before the next dungeon. Stop prevents new work; owned activity and return cleanup settle safely.");
+            ImGui.TextWrapped("AutoDuty ownership is exclusive by user convention: keep other integrations from controlling it or pushing overrides until TT releases each run.");
+        }
+        if (!confirmedProviderOnly && !confirmedFarmingBareMode)
             TextColoredWrapped(TomesTheme.Amber, "Warning: configured AutoDuty termination actions may log out or close the client.");
         ImGui.Separator();
-        if (ImGui.Button(confirmedIsResume ? "Confirm resume" : "Confirm farming plan"))
+        if (ImGui.Button(confirmedProviderOnly ? "Confirm automation" : confirmedIsResume ? "Confirm resume" : "Confirm full automation"))
         {
             try
             {
                 var contentId = snapshot?.CharacterContentId;
                 if (contentId is null or 0)
                     throw new InvalidOperationException("Character identity unavailable in cached snapshot.");
-                farmingPlan.QueueStart(confirmedFarmingDungeon!, confirmedFarmingMode, -1,
-                    confirmedFarmingBareMode, confirmedFarmingPeriods, contentId.Value,
-                    snapshot!.CharacterName, snapshot.CharacterHomeWorld,
-                    confirmedServiceRetainers, confirmedRetainerWaitMinutes);
-                actionMessage = "Plan confirmed; fresh validation queued on framework thread.";
+                if (confirmedProviderOnly)
+                {
+                    var linkedPlan = farmingPlan.Current is { State: "Active" } activePlan ? activePlan.PlanId : null;
+                    automationSession.StartOrResume(contentId.Value, snapshot!.CharacterName, snapshot.CharacterHomeWorld,
+                        serviceRetainers, confirmedRetainerWaitMinutes, configuration.OceanFishingEnabled,
+                        Math.Clamp(configuration.OceanFishingPreparationLeadMinutes, 0, 45),
+                        configuration.OceanFishingCharacterMode, configuration.OceanFishingCharacterContentId,
+                        configuration.OceanFishingCharacterName, configuration.OceanFishingCharacterWorld, linkedPlan);
+                    actionMessage = "Full automation session confirmed. Fishing and retainers remain active until Stop; no dungeon plan was created.";
+                }
+                else
+                {
+                    if (dungeon is null)
+                        throw new InvalidOperationException("Dungeon selection is unavailable.");
+                    farmingPlan.QueueStart(dungeon, confirmedFarmingMode, -1,
+                        confirmedFarmingBareMode, confirmedFarmingPeriods, contentId.Value,
+                        snapshot!.CharacterName, snapshot.CharacterHomeWorld,
+                        confirmedServiceRetainers, confirmedRetainerWaitMinutes);
+                    actionMessage = "Full automation confirmed; fresh dungeon validation queued on framework thread.";
+                }
             }
             catch (Exception error) { actionMessage = error.Message; }
             confirmFarming = false;

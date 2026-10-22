@@ -7,21 +7,32 @@ namespace TomesAndTides.Windows;
 /// <summary>TT-owned slate/cyan ImGui styling; pushes are paired around each window draw.</summary>
 internal static class TomesTheme
 {
-    public static readonly Vector4 Window = Rgb(0x0E2029);
-    public static readonly Vector4 Panel = Rgb(0x152D38);
-    public static readonly Vector4 Raised = Rgb(0x203944);
-    public static readonly Vector4 Hover = Rgb(0x27444F);
-    public static readonly Vector4 Border = Rgb(0x2C4956);
-    public static readonly Vector4 Text = Rgb(0xF3F5F7);
+    private readonly record struct Palette(string Name, uint Window, uint Panel, uint Raised, uint Hover,
+        uint Border, uint Accent, uint Text);
+    private static readonly Palette[] Palettes =
+    [
+        new("Fiery Ocean", 0x003049, 0x780000, 0x9B1019, 0x4D687B, 0x669BBC, 0xC1121F, 0xFDF0D5),
+        new("Dark Sunset", 0x335C67, 0x540B0E, 0x640D14, 0x80551E, 0xE09F3E, 0xE09F3E, 0xFFF3B0),
+        new("Summer Fun", 0x023047, 0x06435B, 0x126A86, 0xA95700, 0x8ECAE6, 0xFFB703, 0xFFFFFF),
+    ];
+    private static Palette current = Palettes[0];
+    public static string[] PresetNames { get; } = Palettes.Select(palette => palette.Name).ToArray();
+    public static string CurrentPreset => current.Name;
+    public static Vector4 Window => Rgb(current.Window);
+    public static Vector4 Panel => Rgb(current.Panel);
+    public static Vector4 Raised => Rgb(current.Raised);
+    public static Vector4 Hover => Rgb(current.Hover);
+    public static Vector4 Border => Rgb(current.Border);
+    public static Vector4 Text => Rgb(current.Text);
     public static readonly Vector4 Muted = Rgb(0xB8C8D0);
-    public static readonly Vector4 Cyan = Rgb(0x00C6DF);
-    public static readonly Vector4 Selected = Rgb(0x075563);
+    public static Vector4 Cyan => Rgb(current.Accent);
+    public static Vector4 Selected => new(Cyan.X * 0.36f, Cyan.Y * 0.36f, Cyan.Z * 0.36f, 1f);
     public static readonly Vector4 Mint = Rgb(0x87E6C7);
     public static readonly Vector4 Amber = Rgb(0xFFD38A);
     public static readonly Vector4 Rose = Rgb(0xEE7788);
 
     private const int StyleVarCount = 10;
-    private static readonly (ImGuiCol Slot, Vector4 Color)[] Colors =
+    private static (ImGuiCol Slot, Vector4 Color)[] Colors =>
     [
         (ImGuiCol.WindowBg, Window), (ImGuiCol.ChildBg, Panel), (ImGuiCol.PopupBg, Panel),
         (ImGuiCol.Text, Text), (ImGuiCol.TextDisabled, Muted), (ImGuiCol.Border, Border),
@@ -43,6 +54,12 @@ internal static class TomesTheme
     ];
 
     public static float Scale => ImGuiHelpers.GlobalScale;
+
+    public static void SetPreset(string? name)
+    {
+        var index = Array.FindIndex(Palettes, palette => string.Equals(palette.Name, name, StringComparison.Ordinal));
+        current = index < 0 ? Palettes[0] : Palettes[index];
+    }
 
     public static void Push()
     {
