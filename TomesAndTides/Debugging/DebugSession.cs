@@ -86,6 +86,8 @@ public sealed class DebugSession(DebugTests tests, IPluginLog log)
             log.Information("Diagnostic test {Test} finished with status {Status} at {CapturedUtc}.",
                 Tests[index].Name, report.Status, capturedUtc);
             var sanitizedReport = Regex.Replace(report.Text, @"(?i)Content ID\s+\d+", "Content ID <redacted>");
+            if (Tests[index].Name == "WahTools discovery")
+                log.Information("WahTools discovery report:\n{Report}", sanitizedReport);
             log.Debug("Diagnostic report for {Test}:\n{Report}", Tests[index].Name, sanitizedReport);
         }
         catch (Exception error)

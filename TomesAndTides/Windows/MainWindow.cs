@@ -341,10 +341,11 @@ public sealed class MainWindow : Window
                 if (ImGui.Button(plan.StopRequested ? "Stop requested" : "Stop automation", new Vector2(-1, 0)) && !plan.StopRequested)
                     retainerHandoff.RequestStop();
             }
-            else if (farmingPlan.CanResumeAfterReload && retainerHandoff.CanResumeAutomationSession &&
-                     oceanFishing.CanResumeAutomationSession)
+            else if (plan.State == "RecoveryRequired")
             {
-                if (ImGui.Button("Acknowledge reload and resume plan", new Vector2(-1, 0)))
+                var canResume = farmingPlan.CanResumeAfterReload && retainerHandoff.CanResumeAutomationSession &&
+                                oceanFishing.CanResumeAutomationSession;
+                if (canResume && ImGui.Button("Acknowledge reload and resume plan", new Vector2(-1, 0)))
                 {
                     if (!farmingPlan.ResumeAfterReload(retainerHandoff.CanResumeAutomationSession &&
                                                        oceanFishing.CanResumeAutomationSession))
@@ -352,13 +353,33 @@ public sealed class MainWindow : Window
                     else
                         actionMessage = "Captured automation session resumed. Fishing settings, handled windows, and verified plan progress are preserved.";
                 }
-                if (ImGui.Button("Acknowledge recovery and stop plan", new Vector2(-1, 0)))
-                    farmingPlan.AcknowledgeRecoveryAndStop();
+                if (!canResume)
+                    TextColoredWrapped(TomesTheme.Amber, "Resume is blocked until the farming character is safe, AutoDuty and providers are idle, and no fishing or retainer handoff needs recovery.");
+
+                var parentStopped = automationSession.Current is null or { State: "Stopped" };
+                var automationSafe = parentStopped || retainerHandoff.CanResumeAutomationSession && oceanFishing.CanResumeAutomationSession;
+                var canAcknowledgeStop = farmingPlan.CanAcknowledgeRecovery && automationSafe;
+                ImGui.BeginDisabled(!canAcknowledgeStop);
+                if (ImGui.Button("Acknowledge recovery and stop automation", new Vector2(-1, 0)))
+                {
+                    if (!farmingPlan.AcknowledgeRecoveryAndStop(automationSafe))
+                        actionMessage = "Recovery was not cleared. Safely resolve any owned fishing/retainer activity and dungeon run first.";
+                    else
+                        actionMessage = "Recovery acknowledged and automation stopped. Start a new session explicitly when ready.";
+                }
+                ImGui.EndDisabled();
+                if (!farmingPlan.CanAcknowledgeRecovery)
+                    TextDisabledWrapped("Stop is unavailable until the linked dungeon run has been safely acknowledged.");
+                else if (!automationSafe)
+                    TextDisabledWrapped("Stop is waiting for safe farming-character identity and idle providers. Resolve fishing or retainer recovery in its tab first.");
             }
-            else if (farmingPlan.Current is { State: "RecoveryRequired", RecoveryKind: "Reload" })
-                TextColoredWrapped(TomesTheme.Amber, "Resume is blocked until the farming character is safe, AutoDuty and providers are idle, and no fishing or retainer handoff needs recovery.");
-            else if (farmingPlan.CanAcknowledgeRecovery && ImGui.Button("Acknowledge recovery and stop plan", new Vector2(-1, 0)))
-                farmingPlan.AcknowledgeRecoveryAndStop();
+            else if (farmingPlan.CanAcknowledgeRecovery && ImGui.Button("Acknowledge recovery and stop automation", new Vector2(-1, 0)))
+            {
+                var automationSafe = automationSession.Current is null or { State: "Stopped" } ||
+                                     retainerHandoff.CanResumeAutomationSession && oceanFishing.CanResumeAutomationSession;
+                if (!farmingPlan.AcknowledgeRecoveryAndStop(automationSafe))
+                    actionMessage = "Recovery was not cleared. Safely resolve any owned provider activity and dungeon run first.";
+            }
             if (plan.State is "Active" or "PendingValidation" or "RecoveryRequired")
                 return;
         }
@@ -654,6 +675,23 @@ public sealed class MainWindow : Window
         }
         else
             TextDisabledWrapped($"WahTools: {(configuration.AutomationSession is { OceanFishingEnabled: true } ? "waiting for eligible window" : "not authorized in current session")}");
+
+        if (oceanFishing.Admission is { } admission)
+        {
+            ImGui.Separator();
+            var diagnosticColor = admission.Code == "AdmissionReady" ? TomesTheme.Mint :
+                admission.Code.Contains("Recovery", StringComparison.Ordinal) ? TomesTheme.Rose : TomesTheme.Amber;
+            TextColoredWrapped(diagnosticColor,
+                $"Admission: {admission.Code}");
+            ImGui.TextWrapped(admission.Detail);
+            if (admission.WindowStartUtc is { } start && admission.LaunchCutoffUtc is { } cutoff)
+                TextDisabledWrapped($"Window: {start.ToLocalTime():f} · launch cutoff: {cutoff.ToLocalTime():t}");
+            if (admission.AutoDutyStopped is not null || admission.AutoRetainerBusy is not null ||
+                admission.LifestreamBusy is not null || admission.WahToolsAvailable is not null)
+                TextDisabledWrapped($"Player safe: {admission.PlayerSafe?.ToString() ?? "unknown"} · AutoDuty stopped: {admission.AutoDutyStopped?.ToString() ?? "unknown"} · AutoRetainer busy/Multi Mode: {admission.AutoRetainerBusy?.ToString() ?? "unknown"}/{admission.AutoRetainerMultiMode?.ToString() ?? "unknown"} · Lifestream busy: {admission.LifestreamBusy?.ToString() ?? "unknown"} · WahTools available/Feesh clean: {admission.WahToolsAvailable?.ToString() ?? "unknown"}/{admission.FeeshClean?.ToString() ?? "unknown"}");
+            if (!string.IsNullOrWhiteSpace(admission.FeeshDetail))
+                TextDisabledWrapped($"Feesh: {admission.FeeshDetail}");
+        }
 
     }
 

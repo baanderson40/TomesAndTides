@@ -21,6 +21,7 @@ public sealed class OceanFishingHandoffController : IDisposable
     private readonly Action save;
     private readonly IWorkflowGameState gameState;
     private readonly IRetainerProvider autoRetainer;
+    private readonly Func<bool> retainerOperationOwned;
     private readonly ILifestreamProvider lifestream;
     private readonly IWahToolsFeeshClient feesh;
     private readonly Func<bool> dungeonOperationOwned;
@@ -32,16 +33,23 @@ public sealed class OceanFishingHandoffController : IDisposable
     private DateTimeOffset nextProviderPollUtc;
     private bool sawOceanTerritory;
     private bool disposed;
+    private OceanFishingAdmissionDiagnostic? admission;
+    private DateTimeOffset? observedEligibleWindowStartUtc;
+    private IReadOnlyList<RetainerCharacterIdentity> fishingRoster = [];
+    private bool fishingRosterAvailable;
+    private DateTimeOffset nextFishingRosterReadUtc;
     public bool CanResumeAutomationSession { get; private set; }
 
     public OceanFishingHandoffController(Configuration configuration, Action save, IWorkflowGameState gameState,
         IRetainerProvider autoRetainer, ILifestreamProvider lifestream, IWahToolsFeeshClient feesh,
-        Func<bool> dungeonOperationOwned, Func<bool?> readAutoDutyStopped, IWorkflowLog log, IUtcClock? clock = null)
+        Func<bool> dungeonOperationOwned, Func<bool?> readAutoDutyStopped, IWorkflowLog log, IUtcClock? clock = null,
+        Func<bool>? retainerOperationOwned = null)
     {
         this.configuration = configuration;
         this.save = save;
         this.gameState = gameState;
         this.autoRetainer = autoRetainer;
+        this.retainerOperationOwned = retainerOperationOwned ?? (() => false);
         this.lifestream = lifestream;
         this.feesh = feesh;
         this.dungeonOperationOwned = dungeonOperationOwned;
@@ -53,6 +61,7 @@ public sealed class OceanFishingHandoffController : IDisposable
     }
 
     public OceanFishingOperationRecord? Current => configuration.OceanFishingOperation;
+    public OceanFishingAdmissionDiagnostic? Admission => admission;
     public bool OwnsActivity => Current is { State: not ("Completed" or "Skipped" or "RecoveryAcknowledged") };
     public bool NeedsRecovery => Current is { State: "RecoveryRequired" };
     public bool PrioritizesNow
@@ -68,7 +77,7 @@ public sealed class OceanFishingHandoffController : IDisposable
                    !OceanFishingSchedulePolicy.IsWindowHandled(configuration.HandledOceanFishingWindowsUtc, window.StartUtc);
         }
     }
-    public string Status => Current?.Detail ?? "Monitoring Ocean Fishing windows";
+    public string Status => Current?.Detail ?? admission?.Detail ?? "Monitoring Ocean Fishing windows";
 
     /// <summary>Refreshes cached recovery preflight on the framework thread.</summary>
     public void RefreshResumeReadiness()
@@ -142,31 +151,7 @@ public sealed class OceanFishingHandoffController : IDisposable
                 TickOperation(operation);
                 return;
             }
-            var session = configuration.AutomationSession;
-            if (!allowNewWindow || session is not { State: "Active", StopRequested: false, OceanFishingEnabled: true })
-                return;
-            var now = clock.UtcNow;
-            var window = OceanFishingSchedulePolicy.GetWindow(now, session.OceanFishingPreparationLeadMinutes);
-            if (!OceanFishingSchedulePolicy.IsPreparationEligible(now, window) ||
-                OceanFishingSchedulePolicy.IsWindowHandled(configuration.HandledOceanFishingWindowsUtc, window.StartUtc))
-                return;
-
-            if (now >= window.LaunchCutoffUtc)
-            {
-                MarkWindowHandled(window.StartUtc);
-                return;
-            }
-            if (dungeonOperationOwned())
-                return;
-            if (!feesh.IsAvailable || !gameState.IsLoggedIn || !gameState.HasLocalPlayer ||
-                !gameState.IsSafePlayerState || readAutoDutyStopped() != true ||
-                !autoRetainer.TryGetProviderState(out var retainerBusy, out var retainerActive) ||
-                retainerBusy || retainerActive || !lifestream.TryGetBusy(out var lifestreamBusy) || lifestreamBusy)
-                return;
-            if (!TrySelectFishingCharacter(session, out var target))
-                return;
-            var status = feesh.ReadStatus();
-            if (!status.IsClean || now - status.ObservedUtc > StatusFreshness)
+            if (!TryAdmitNewWindow(allowNewWindow, out var session, out var window, out var target, out _))
                 return;
 
             var claimedOperation = new OceanFishingOperationRecord
@@ -182,7 +167,7 @@ public sealed class OceanFishingHandoffController : IDisposable
                 FishingCharacterWorld = target.World,
                 State = "WindowClaimed",
                 Detail = $"Claimed Ocean Fishing window {window.StartUtc:O}; one voyage maximum.",
-                PhaseChangedUtc = now,
+                PhaseChangedUtc = clock.UtcNow,
             };
             configuration.OceanFishingOperation = claimedOperation;
             if (!SaveOrRecover("Ocean Fishing window claim"))
@@ -193,7 +178,11 @@ public sealed class OceanFishingHandoffController : IDisposable
         }
         catch (Exception error)
         {
-            RequireRecovery($"Unexpected Ocean Fishing coordinator error: {error.GetBaseException().Message}", error);
+            var detail = $"Unexpected Ocean Fishing preflight/coordinator error: {error.GetBaseException().Message}";
+            if (Current is null)
+                PublishDiagnostic("CoordinatorError", detail);
+            else
+                RequireRecovery(detail, error);
         }
     }
 
@@ -203,6 +192,236 @@ public sealed class OceanFishingHandoffController : IDisposable
         gameState.DutyStarted -= OnDutyStarted;
         gameState.DutyCompleted -= OnDutyCompleted;
     }
+
+    private bool TryAdmitNewWindow(bool allowNewWindow, out AutomationSessionRecord session,
+        out OceanFishingWindow window, out RetainerCharacterIdentity target, out WahToolsFeeshStatus feeshStatus)
+    {
+        session = configuration.AutomationSession!;
+        window = default;
+        target = new RetainerCharacterIdentity(0, string.Empty, string.Empty);
+        feeshStatus = WahToolsFeeshStatus.Unknown("Not read");
+        var now = clock.UtcNow;
+        if (session is not { State: "Active", StopRequested: false, OceanFishingEnabled: true })
+        {
+            observedEligibleWindowStartUtc = null;
+            PublishDiagnostic("SessionInactive", "Ocean Fishing is not enabled in an active automation session.");
+            return false;
+        }
+        window = OceanFishingSchedulePolicy.GetWindow(now, session.OceanFishingPreparationLeadMinutes);
+        if (observedEligibleWindowStartUtc is { } observedWindow && now >= observedWindow.Add(OceanFishingSchedulePolicy.LaunchCutoffOffset))
+        {
+            observedEligibleWindowStartUtc = null;
+            var missedCutoff = observedWindow.Add(OceanFishingSchedulePolicy.LaunchCutoffOffset);
+            if (!OceanFishingSchedulePolicy.IsWindowHandled(configuration.HandledOceanFishingWindowsUtc, observedWindow))
+            {
+                MarkWindowHandled(observedWindow);
+                PublishDiagnostic("MissedLaunchCutoff",
+                    $"Observed Ocean Fishing window {observedWindow:HH:mm} UTC passed its launch cutoff; no retry will occur.",
+                    observedWindow, missedCutoff);
+                return false;
+            }
+        }
+        if (OceanFishingSchedulePolicy.IsPreparationEligible(now, window) &&
+            !OceanFishingSchedulePolicy.IsWindowHandled(configuration.HandledOceanFishingWindowsUtc, window.StartUtc))
+            observedEligibleWindowStartUtc = window.StartUtc;
+        if (!allowNewWindow)
+        {
+            PublishDiagnostic("AdmissionPaused", "Another owned activity or recovery has paused new Ocean Fishing admission.", window.StartUtc, window.LaunchCutoffUtc);
+            return false;
+        }
+        if (OceanFishingSchedulePolicy.IsWindowHandled(configuration.HandledOceanFishingWindowsUtc, window.StartUtc))
+        {
+            PublishDiagnostic("WindowAlreadyHandled", $"Ocean Fishing window {window.StartUtc:O} was already consumed.", window.StartUtc, window.LaunchCutoffUtc);
+            return false;
+        }
+        if (now < window.PreparationStartUtc || now >= window.LaunchCutoffUtc)
+        {
+            PublishDiagnostic("OutsidePreparationWindow",
+                $"Waiting for preparation at {window.PreparationStartUtc:HH:mm} UTC for window {window.StartUtc:HH:mm} UTC; launch cutoff is {window.LaunchCutoffUtc:HH:mm} UTC.",
+                window.StartUtc, window.LaunchCutoffUtc);
+            return false;
+        }
+        if (dungeonOperationOwned())
+        {
+            PublishDiagnostic("DungeonOwnsActivity", "Waiting for the owned dungeon operation to settle before fishing admission.", window.StartUtc, window.LaunchCutoffUtc);
+            return false;
+        }
+        if (retainerOperationOwned())
+        {
+            PublishDiagnostic("RetainerOwnsActivity", "Waiting for the owned AutoRetainer pass to settle; it will not be interrupted.",
+                window.StartUtc, window.LaunchCutoffUtc, autoRetainerBusy: true);
+            return false;
+        }
+        if (!gameState.IsLoggedIn || !gameState.HasLocalPlayer)
+        {
+            PublishDiagnostic("PlayerUnavailable", "Logged-in player identity is unavailable.", window.StartUtc, window.LaunchCutoffUtc, false);
+            return false;
+        }
+        if (!gameState.IsSafePlayerState)
+        {
+            PublishDiagnostic("PlayerUnsafe", "Waiting for a safe player state before Ocean Fishing.", window.StartUtc, window.LaunchCutoffUtc, false);
+            return false;
+        }
+        var autoDutyStopped = readAutoDutyStopped();
+        if (autoDutyStopped != true)
+        {
+            PublishDiagnostic(autoDutyStopped is null ? "AutoDutyUnknown" : "AutoDutyRunning",
+                autoDutyStopped is null ? "AutoDuty stopped state is unknown." : "AutoDuty must be stopped before fishing admission.",
+                window.StartUtc, window.LaunchCutoffUtc, true, autoDutyStopped);
+            return false;
+        }
+        if (!autoRetainer.TryGetProviderState(out var retainerBusy, out var retainerActive))
+        {
+            PublishDiagnostic("AutoRetainerUnknown", "AutoRetainer state IPC is unavailable; fishing admission remains blocked.",
+                window.StartUtc, window.LaunchCutoffUtc, true, true, null, null);
+            return false;
+        }
+        if (retainerBusy || retainerActive)
+        {
+            PublishDiagnostic("AutoRetainerBusy", retainerBusy ? "AutoRetainer is busy; its owned work will not be preempted." : "AutoRetainer Multi Mode is active.",
+                window.StartUtc, window.LaunchCutoffUtc, true, true, retainerBusy, retainerActive);
+            return false;
+        }
+        if (!lifestream.TryGetBusy(out var lifestreamBusy))
+        {
+            PublishDiagnostic("LifestreamUnknown", "Lifestream busy state is unavailable; fishing admission remains blocked.",
+                window.StartUtc, window.LaunchCutoffUtc, true, true, false, false, null);
+            return false;
+        }
+        if (lifestreamBusy)
+        {
+            PublishDiagnostic("LifestreamBusy", "Lifestream is busy; waiting before fishing admission.",
+                window.StartUtc, window.LaunchCutoffUtc, true, true, false, false, true);
+            return false;
+        }
+        feeshStatus = feesh.ReadStatus();
+        if (!feeshStatus.Available)
+        {
+            PublishDiagnostic("WahToolsUnavailable", feeshStatus.Detail, window.StartUtc, window.LaunchCutoffUtc,
+                true, true, false, false, false, false, null, feeshStatus.Detail);
+            return false;
+        }
+        if (!feeshStatus.IsClean)
+        {
+            var (code, detail) = DescribeFeeshBlocker(feeshStatus);
+            PublishDiagnostic(code, detail, window.StartUtc, window.LaunchCutoffUtc,
+                true, true, false, false, false, true, false, feeshStatus.Detail);
+            return false;
+        }
+        if (now - feeshStatus.ObservedUtc > StatusFreshness)
+        {
+            PublishDiagnostic("WahToolsStatusStale", $"WahTools status is stale ({(now - feeshStatus.ObservedUtc).TotalSeconds:F1}s old).",
+                window.StartUtc, window.LaunchCutoffUtc, true, true, false, false, false, true, false, feeshStatus.Detail);
+            return false;
+        }
+        if (!TrySelectFishingCharacter(session, out target))
+        {
+            var reason = session.OceanFishingCharacterMode == "SelectedCharacter"
+                ? fishingRosterAvailable ? "Selected fishing character is absent or no longer matches the registered AutoRetainer roster."
+                    : "AutoRetainer character roster is unavailable."
+                : "Current farming-character identity is invalid.";
+            PublishDiagnostic("FishingCharacterUnavailable", reason, window.StartUtc, window.LaunchCutoffUtc,
+                true, true, false, false, false, true, true, feeshStatus.Detail);
+            return false;
+        }
+        PublishDiagnostic("AdmissionReady", $"Preflight passed for Ocean Fishing window {window.StartUtc:HH:mm} UTC; one voyage may launch before {window.LaunchCutoffUtc:HH:mm} UTC.",
+            window.StartUtc, window.LaunchCutoffUtc, true, true, false, false, false, true, true, feeshStatus.Detail, information: true);
+        return true;
+    }
+
+    private bool TryCheckLaunchReadiness(OceanFishingOperationRecord operation, out WahToolsFeeshStatus status)
+    {
+        var cutoff = operation.WindowStartUtc.Add(OceanFishingSchedulePolicy.LaunchCutoffOffset);
+        status = WahToolsFeeshStatus.Unknown("Not read");
+        if (!MatchesFishingCharacter(operation))
+        {
+            PublishDiagnostic("FishingCharacterNotCurrent", "Waiting for the selected fishing-character identity.", operation.WindowStartUtc, cutoff);
+            return false;
+        }
+        if (!gameState.IsSafePlayerState)
+        {
+            PublishDiagnostic("PlayerUnsafe", "Waiting for a safe fishing-character state before launch.", operation.WindowStartUtc, cutoff, false);
+            return false;
+        }
+        var autoDutyStopped = readAutoDutyStopped();
+        if (autoDutyStopped != true)
+        {
+            PublishDiagnostic(autoDutyStopped is null ? "AutoDutyUnknown" : "AutoDutyRunning",
+                autoDutyStopped is null ? "AutoDuty stopped state is unknown." : "AutoDuty must be stopped before launch.",
+                operation.WindowStartUtc, cutoff, true, autoDutyStopped);
+            return false;
+        }
+        if (!autoRetainer.TryGetProviderState(out var busy, out var active) || busy || active)
+        {
+            PublishDiagnostic(busy || active ? "AutoRetainerBusy" : "AutoRetainerUnknown",
+                busy ? "AutoRetainer is busy." : active ? "AutoRetainer Multi Mode is active." : "AutoRetainer state is unknown.",
+                operation.WindowStartUtc, cutoff, true, true, busy, active);
+            return false;
+        }
+        if (!lifestream.TryGetBusy(out var lifestreamBusy) || lifestreamBusy)
+        {
+            PublishDiagnostic(lifestreamBusy ? "LifestreamBusy" : "LifestreamUnknown",
+                lifestreamBusy ? "Lifestream is busy." : "Lifestream busy state is unknown.",
+                operation.WindowStartUtc, cutoff, true, true, false, false, lifestreamBusy);
+            return false;
+        }
+        status = feesh.ReadStatus();
+        if (!status.Available || !status.IsClean || clock.UtcNow - status.ObservedUtc > StatusFreshness)
+        {
+            var (code, detail) = !status.Available
+                ? ("WahToolsUnavailable", status.Detail)
+                : !status.IsClean
+                    ? DescribeFeeshBlocker(status)
+                    : ("WahToolsStatusStale", "WahTools Feesh status is stale.");
+            PublishDiagnostic(code, detail, operation.WindowStartUtc, cutoff, true, true, false, false, false,
+                status.Available, status.IsClean, status.Detail);
+            return false;
+        }
+        return true;
+    }
+
+    private static (string Code, string Detail) DescribeFeeshBlocker(WahToolsFeeshStatus status)
+    {
+        if (status.TripRunning is null)
+            return ("FeeshTripStateUnknown", "WahTools trip running state is unknown.");
+        if (status.TripRunning == true)
+            return ("FeeshTripRunning", $"WahTools trip is running ({status.TripState ?? "state unavailable"}; {status.TripStatus ?? "status unavailable"}).");
+        if (status.OnBoat is null)
+            return ("FeeshBoatStateUnknown", "WahTools boat state is unknown.");
+        if (status.OnBoat == true)
+            return ("FeeshOnBoat", "WahTools reports the player is already on the boat.");
+        if (status.Cleaning is null || status.CleanerRunning is null || status.DesyntherRunning is null ||
+            status.DiscarderRunning is null || status.BuyerBusy is null)
+            return ("FeeshCleanupStateUnknown",
+                $"WahTools cleanup state incomplete: Cleaning={Show(status.Cleaning)}, Cleaner={Show(status.CleanerRunning)}, Desynther={Show(status.DesyntherRunning)}, Discarder={Show(status.DiscarderRunning)}, Buyer={Show(status.BuyerBusy)}.");
+        return ("FeeshCleanupBusy",
+            $"WahTools cleanup still active: Cleaning={status.Cleaning}, Cleaner={status.CleanerRunning}, Desynther={status.DesyntherRunning}, Discarder={status.DiscarderRunning}, Buyer={status.BuyerBusy}.");
+    }
+
+    private static string Show(bool? value) => value?.ToString() ?? "unknown";
+
+    private void PublishDiagnostic(string code, string detail, DateTimeOffset? windowStart = null,
+        DateTimeOffset? cutoff = null, bool? playerSafe = null, bool? autoDutyStopped = null,
+        bool? autoRetainerBusy = null, bool? autoRetainerMultiMode = null, bool? lifestreamBusy = null,
+        bool? wahToolsAvailable = null, bool? feeshClean = null, string? feeshDetail = null, bool information = false)
+    {
+        var next = new OceanFishingAdmissionDiagnostic(clock.UtcNow, windowStart, cutoff, code, detail,
+            playerSafe, autoDutyStopped, autoRetainerBusy, autoRetainerMultiMode, lifestreamBusy,
+            wahToolsAvailable, feeshClean, feeshDetail);
+        if (admission is { } previous && previous with { ObservedUtc = next.ObservedUtc } == next)
+            return;
+        admission = next;
+        if (information || IsExpectedWaitCode(code))
+            log.Information("Ocean Fishing admission {Code}: {Detail} window={WindowStartUtc} cutoff={CutoffUtc}.",
+                code, detail, windowStart?.ToString("O") ?? "unknown", cutoff?.ToString("O") ?? "unknown");
+        else
+            log.Warning("Ocean Fishing admission blocked {Code}: {Detail} window={WindowStartUtc} cutoff={CutoffUtc}.",
+                code, detail, windowStart?.ToString("O") ?? "unknown", cutoff?.ToString("O") ?? "unknown");
+    }
+
+    private static bool IsExpectedWaitCode(string code) => code is
+        "SessionInactive" or "AdmissionPaused" or "OutsidePreparationWindow" or "WindowAlreadyHandled" or
+        "DungeonOwnsActivity" or "RetainerOwnsActivity" or "PlayerUnsafe" or "PlayerUnavailable";
 
     private void TickOperation(OceanFishingOperationRecord operation)
     {
@@ -321,13 +540,11 @@ public sealed class OceanFishingHandoffController : IDisposable
             BeginReturn(operation, "Missed safe launch cutoff; skipping this Ocean Fishing window.", skipped: true);
             return;
         }
-        if (!MatchesFishingCharacter(operation) || !gameState.IsSafePlayerState || readAutoDutyStopped() != true ||
-            !autoRetainer.TryGetProviderState(out var busy, out var active) || busy || active ||
-            !lifestream.TryGetBusy(out var lifestreamBusy) || lifestreamBusy)
+        if (!TryCheckLaunchReadiness(operation, out var feeshStatus))
             return;
-        var status = feesh.ReadStatus();
-        if (!status.IsClean || clock.UtcNow - status.ObservedUtc > StatusFreshness)
-            return;
+        PublishDiagnostic("LaunchReady", "All launch preflight checks passed; recording the one-time WahTools launch intent.",
+            operation.WindowStartUtc, window.LaunchCutoffUtc, true, true, false, false, false,
+            feeshStatus.Available, feeshStatus.IsClean, feeshStatus.Detail, information: true);
 
         operation.LaunchIntentUtc = clock.UtcNow;
         operation.State = "LaunchIntentRecorded";
@@ -469,10 +686,16 @@ public sealed class OceanFishingHandoffController : IDisposable
                 session.FarmingCharacterName, session.FarmingCharacterWorld);
             return target.ContentId != 0 && !string.IsNullOrWhiteSpace(target.Name) && !string.IsNullOrWhiteSpace(target.World);
         }
-        if (session.OceanFishingCharacterMode != "SelectedCharacter" ||
-            !autoRetainer.TryGetRegisteredCharacters(out var roster))
+        if (session.OceanFishingCharacterMode != "SelectedCharacter")
             return false;
-        var match = roster.FirstOrDefault(character => character.ContentId == session.OceanFishingCharacterContentId);
+        if (clock.UtcNow >= nextFishingRosterReadUtc)
+        {
+            nextFishingRosterReadUtc = clock.UtcNow.AddSeconds(30);
+            fishingRosterAvailable = autoRetainer.TryGetRegisteredCharacters(out fishingRoster);
+        }
+        if (!fishingRosterAvailable)
+            return false;
+        var match = fishingRoster.FirstOrDefault(character => character.ContentId == session.OceanFishingCharacterContentId);
         if (match is null || match.Name != session.OceanFishingCharacterName || match.World != session.OceanFishingCharacterWorld)
             return false;
         target = match;

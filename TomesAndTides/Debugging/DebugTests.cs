@@ -6,6 +6,7 @@ using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using Lumina.Excel.Sheets;
+using TomesAndTides.Integrations;
 
 namespace TomesAndTides.Debugging;
 
@@ -13,7 +14,8 @@ namespace TomesAndTides.Debugging;
 public sealed class DebugTests(
     IDataManager data, IClientState client, IObjectTable objects,
     IDalamudPluginInterface pluginInterface, IUnlockState unlocks,
-    IPlayerState playerState, ICondition conditions, Configuration configuration)
+    IPlayerState playerState, ICondition conditions, Configuration configuration,
+    WahToolsFeeshStatusReader feeshStatusReader)
 {
     // FFXIV's current tomestone holding rule is 2,000 for each type.
     // Unlike the weekly cap, the holding cap is not represented in the exposed Lumina sheets.
@@ -71,7 +73,34 @@ public sealed class DebugTests(
         new("Dungeon eligibility", "Check the selected dungeon and Support/Trust mode without changing game or provider state.", ReadEligibility),
         new("Dungeon rewards", "Discover positive-reward dungeons and show boss reward breakdowns and NPC-mode sheet evidence.", ReadDungeons),
         new("Live tome counts", "Read the logged-in character's held balance, weekly acquired count, and live cap.", ReadCounts),
+        new("WahTools discovery", "Read-only check of Dalamud metadata, ECommons plugin-instance lookup, Feesh module, and status reflection. Does not call voyage IPC.", ReadWahToolsDiscovery),
     ];
+
+    private DebugReport ReadWahToolsDiscovery()
+    {
+        var status = feeshStatusReader.Read();
+        var discovery = feeshStatusReader.LastDiscovery;
+        var completed = discovery.Stage == "FeeshStatus" && status.Available;
+        var text = new StringBuilder()
+            .AppendLine($"Observed UTC: {discovery.ObservedUtc:O}")
+            .AppendLine($"Installed metadata found: {discovery.MetadataFound}")
+            .AppendLine($"Installed metadata loaded: {discovery.MetadataLoaded}")
+            .AppendLine($"WahTools version: {discovery.PluginVersion ?? "unknown"}")
+            .AppendLine($"Plugin instance resolved: {discovery.PluginInstanceResolved?.ToString() ?? "not reached"}")
+            .AppendLine($"Feesh module found: {discovery.FeeshModuleFound?.ToString() ?? "not reached"}")
+            .AppendLine($"Feesh module loaded: {discovery.FeeshModuleLoaded?.ToString() ?? "not reached"}")
+            .AppendLine($"Failure/read stage: {discovery.Stage}")
+            .AppendLine($"Trip initialized/running: {(status.Available ? status.TripInitialized.ToString() : "unknown")}/{Show(status.TripRunning)}")
+            .AppendLine($"On boat: {Show(status.OnBoat)}")
+            .AppendLine($"Cleanup: Cleaning={Show(status.Cleaning)}, Cleaner={Show(status.CleanerRunning)}, Desynther={Show(status.DesyntherRunning)}, Discarder={Show(status.DiscarderRunning)}, Buyer={Show(status.BuyerBusy)}")
+            .AppendLine($"Overall clean: {status.IsClean}")
+            .AppendLine($"Detail: {discovery.Detail}")
+            .AppendLine("No launch, stop, character-switch, or provider-control IPC was called.")
+            .ToString();
+        return new(completed ? "Completed" : "Unavailable", text);
+    }
+
+    private static string Show(bool? value) => value?.ToString() ?? "unknown";
 
     private sealed record Currency(uint ItemId, string Name, uint Category, int SheetLimit)
     {

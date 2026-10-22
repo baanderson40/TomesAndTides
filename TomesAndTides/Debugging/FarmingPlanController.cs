@@ -51,7 +51,12 @@ public sealed class FarmingPlanController(
                 return false;
             var currentWeek = FarmingSchedulePolicy.GetWeekStartUtc(Clock.UtcNow);
             if (plan.WeekStartUtc == currentWeek)
-                return plan.State == "Stopped" && Clock.UtcNow < plan.FinishDeadlineUtc;
+                return plan.State switch
+                {
+                    "Stopped" => Clock.UtcNow < plan.FinishDeadlineUtc,
+                    "RecoveryAcknowledged" => Clock.UtcNow < plan.WeeklyResetUtc,
+                    _ => false,
+                };
             return true;
         }
     }
@@ -176,7 +181,8 @@ public sealed class FarmingPlanController(
             Math.Clamp(configuration.OceanFishingPreparationLeadMinutes, 0, 45), configuration.OceanFishingCharacterMode,
             configuration.OceanFishingCharacterContentId, configuration.OceanFishingCharacterName,
             configuration.OceanFishingCharacterWorld, plan.PlanId);
-        var archivedPrior = previousPlan is not null && previousPlan.WeekStartUtc != plan.WeekStartUtc;
+        var archivedPrior = previousPlan is not null &&
+                            (previousPlan.WeekStartUtc != plan.WeekStartUtc || previousPlan.State == "RecoveryAcknowledged");
         if (archivedPrior)
         {
             configuration.FarmingPlanHistory ??= [];
@@ -228,19 +234,74 @@ public sealed class FarmingPlanController(
         return SavePlan(plan, "complete retainer checkpoint");
     }
 
-    public bool AcknowledgeRecoveryAndStop()
+    public bool AcknowledgeRecoveryAndStop(bool automationSafe)
     {
         var plan = Current;
-        if (plan is null || !CanAcknowledgeRecovery)
+        if (plan is null || !CanAcknowledgeRecovery || !automationSafe ||
+            configuration.RetainerHandoff is { State: not ("Completed" or "RecoveryAcknowledged") } ||
+            configuration.OceanFishingOperation is { State: not ("Completed" or "Skipped" or "RecoveryAcknowledged") })
             return false;
         if (dungeonRun.Current is { } linkedRun && linkedRun.FarmingPlanId == plan.PlanId && !dungeonRun.Acknowledge())
             return false;
+        var previousPlanStopRequested = plan.StopRequested;
+        var parent = configuration.AutomationSession;
+        var retainerSession = configuration.RetainerSession;
+        var previousParentState = parent?.State;
+        var previousParentRecoveryKind = parent?.RecoveryKind;
+        var previousParentDetail = parent?.Detail;
+        var previousParentStopRequested = parent?.StopRequested;
+        var previousRetainerState = retainerSession?.State;
+        var previousRetainerRecoveryKind = retainerSession?.RecoveryKind;
+        var previousRetainerDetail = retainerSession?.Detail;
+        var previousRetainerStopRequested = retainerSession?.StopRequested;
         plan.State = "RecoveryAcknowledged";
         plan.RecoveryKind = "AcknowledgedStop";
         plan.StopRequested = true;
-        plan.Detail = "Recovery acknowledged by user; this plan will not resume or retry.";
+        plan.Detail = "Recovery acknowledged by user; this plan will not resume or retry. Automation stopped at a verified safe boundary.";
         plan.CurrentOperationId = null;
-        return SavePlan(plan, "recovery acknowledgment");
+        if (parent is { State: "Active" or "StopRequested" or "RecoveryRequired" })
+        {
+            parent.State = "Stopped";
+            parent.StopRequested = true;
+            parent.RecoveryKind = null;
+            parent.Detail = "Recovery acknowledged and automation stopped; no ambiguous request was replayed.";
+        }
+        if (retainerSession is { State: "Active" or "StopRequested" or "RecoveryRequired" })
+        {
+            retainerSession.State = "Stopped";
+            retainerSession.StopRequested = true;
+            retainerSession.RecoveryKind = null;
+            retainerSession.Detail = "Automation recovery acknowledged and retainer session stopped safely.";
+        }
+        try
+        {
+            save();
+            log.Information("Farming plan {PlanId} and linked automation recovery acknowledged and stopped.", plan.PlanId);
+            return true;
+        }
+        catch (Exception error)
+        {
+            plan.State = "RecoveryRequired";
+            plan.RecoveryKind = "PersistenceFailure";
+            plan.Detail = "Could not persist recovery stop; automation remains blocked.";
+            plan.StopRequested = previousPlanStopRequested;
+            if (parent is not null)
+            {
+                parent.State = previousParentState!;
+                parent.RecoveryKind = previousParentRecoveryKind;
+                parent.Detail = previousParentDetail!;
+                parent.StopRequested = previousParentStopRequested!.Value;
+            }
+            if (retainerSession is not null)
+            {
+                retainerSession.State = previousRetainerState!;
+                retainerSession.RecoveryKind = previousRetainerRecoveryKind;
+                retainerSession.Detail = previousRetainerDetail!;
+                retainerSession.StopRequested = previousRetainerStopRequested!.Value;
+            }
+            log.Error(error, "Farming plan {PlanId} recovery stop could not be persisted; automation remains blocked.", plan.PlanId);
+            return false;
+        }
     }
 
     public bool ResumeAfterReload(bool automationSafe)

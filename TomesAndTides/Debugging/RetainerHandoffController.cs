@@ -204,7 +204,10 @@ public sealed class RetainerHandoffController(
         var checkpointPending = checkpointOperationId is not null;
         if (checkpointPending && plan is null)
             return;
-        if (!allowNewWork && !checkpointPending)
+        // A saved checkpoint is outstanding work, not permission to bypass the
+        // activity coordinator's priority decision. Owned handoffs were handled
+        // above and may still settle safely while new work is paused.
+        if (!allowNewWork)
             return;
         if (!checkpointPending && !farmingPlan.AllowsRetainerHandoffNow && !(allowNewWork && plan is null))
             return;

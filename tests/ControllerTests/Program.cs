@@ -20,6 +20,16 @@ var tests = new (string Name, Action Run)[]
     ("reload resume restores parent session and captured fishing settings", TestReloadResumesParentSession),
     ("failed coordinated resume restores recovery state", TestReloadResumePersistenceFailure),
     ("ambiguous fishing recovery blocks farming resume", TestAmbiguousFishingBlocksResume),
+    ("uninitialized WahTools trip is treated as idle", TestUninitializedTripIsIdle),
+    ("Ocean Fishing launches once during an active window with completed dungeon allocation", TestOceanFishingLaunchDuringWindow),
+    ("Ocean Fishing cutoff miss is recorded before schedule advances", TestOceanFishingMissedCutoff),
+    ("reload recovery can be stopped independently of Resume eligibility", TestReloadRecoveryCanStop),
+    ("recovery stop preserves unresolved fishing ownership", TestRecoveryStopPreservesFishingOwnership),
+    ("acknowledged recovery allows new same-week plan", TestAcknowledgedRecoveryAllowsNewPlan),
+    ("fishing priority defers a new retainer checkpoint pass", TestFishingPriorityDefersRetainerCheckpoint),
+    ("unobserved past fishing window is not reported as missed", TestUnobservedFishingWindowIsNotMissed),
+    ("observed fishing window cutoff is reported once", TestObservedFishingWindowMissedOnce),
+    ("normal inactive and ownership waits are informational", TestFishingWaitDiagnosticsAreInformational),
 };
 
 var failed = 0;
@@ -322,6 +332,191 @@ static void TestAmbiguousFishingBlocksResume()
     Equal(0, h.Retainers.PassRequests, "blocked recovery does not replay retainer work");
 }
 
+static void TestUninitializedTripIsIdle()
+{
+    Equal(false, WahToolsFeeshStatus.NormalizeTripRunning(false, null), "null trip means not running");
+    Equal(null, WahToolsFeeshStatus.NormalizeTripRunning(true, null), "initialized trip with unknown running state remains unknown");
+    Equal(true, WahToolsFeeshStatus.NormalizeTripRunning(true, true), "active trip remains active");
+}
+
+static void TestOceanFishingLaunchDuringWindow()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    h.Clock.Advance(TimeSpan.FromHours(1).Add(TimeSpan.FromMinutes(7))); // 10:07 UTC, cutoff at 10:13.
+    h.Configuration.AutomationSession!.OceanFishingEnabled = true;
+    h.Configuration.AutomationSession.OceanFishingPreparationLeadMinutes = 15;
+    var log = new NullWorkflowLog();
+    var feesh = new FakeFeesh(() => CreateIdleFeeshStatus(h.Clock.UtcNow));
+    using var ocean = new OceanFishingHandoffController(h.Configuration, () => { }, h.Game, h.Retainers,
+        h.Lifestream, feesh, () => h.Dungeon.Current is not null, () => true, log, h.Clock);
+
+    ocean.Tick();
+    Equal("VerifyingFishingCharacter", ocean.Current!.State, "farming character is accepted as selected fishing character");
+    ocean.Tick();
+    Equal(1, feesh.LaunchCalls, "CatchTheBoat is requested once");
+    Equal("AwaitingBoarding", ocean.Current!.State, "accepted launch waits for observed boarding");
+    Equal("LaunchReady", ocean.Admission!.Code, "cached admission reports passed launch preflight");
+}
+
+static void TestOceanFishingMissedCutoff()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    h.Configuration.AutomationSession!.OceanFishingEnabled = true;
+    var feesh = new FakeFeesh(() => CreateIdleFeeshStatus(h.Clock.UtcNow));
+    using var ocean = new OceanFishingHandoffController(h.Configuration, () => { }, h.Game, h.Retainers,
+        h.Lifestream, feesh, () => true, () => true, new NullWorkflowLog(), h.Clock);
+
+    h.Clock.Advance(TimeSpan.FromMinutes(45)); // observed preparation for 10:00 UTC window
+    ocean.Tick();
+    h.Clock.Advance(TimeSpan.FromMinutes(28)); // 10:13 UTC launch cutoff
+    ocean.Tick();
+    Equal(0, feesh.LaunchCalls, "cutoff prevents CatchTheBoat");
+    Equal("MissedLaunchCutoff", ocean.Admission!.Code, "missed cutoff is visible");
+    True(h.Configuration.HandledOceanFishingWindowsUtc.Contains(new DateTimeOffset(2026, 10, 21, 10, 0, 0, TimeSpan.Zero)),
+        "missed window is persisted as handled");
+}
+
+static void TestFishingPriorityDefersRetainerCheckpoint()
+{
+    var h = new Harness(known: true, ready: true, seedCompletedRun: false);
+    h.Configuration.FarmingPlan!.RetainerCheckpointOperationId = "verified-run";
+
+    h.Handoff.Tick(allowNewWork: false);
+    Equal(0, h.Retainers.PassRequests, "fishing priority prevents a new checkpoint-triggered pass");
+    Equal("verified-run", h.Configuration.FarmingPlan.RetainerCheckpointOperationId, "checkpoint is preserved while deferred");
+    True(h.Configuration.RetainerHandoff is null, "no handoff or launch intent is created while deferred");
+
+    h.Handoff.Tick(allowNewWork: true);
+    Equal(1, h.Retainers.PassRequests, "deferred checkpoint proceeds when priority is released");
+    Equal("AwaitingStart", h.Configuration.RetainerHandoff!.State, "new pass retains normal ownership lifecycle");
+
+    h.Retainers.Busy = true;
+    h.Retainers.Active = true;
+    h.Handoff.Tick(allowNewWork: false);
+    Equal("RunningPass", h.Configuration.RetainerHandoff.State,
+        "an already-owned pass is still observed and allowed to settle while new work is paused");
+    Equal(1, h.Retainers.PassRequests, "settling owned work does not issue a second pass");
+}
+
+static void TestUnobservedFishingWindowIsNotMissed()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    h.Configuration.AutomationSession!.OceanFishingEnabled = true;
+    var feesh = new FakeFeesh(() => CreateIdleFeeshStatus(h.Clock.UtcNow));
+    using var ocean = new OceanFishingHandoffController(h.Configuration, () => { }, h.Game, h.Retainers,
+        h.Lifestream, feesh, () => false, () => true, new NullWorkflowLog(), h.Clock);
+
+    h.Clock.Advance(TimeSpan.FromHours(1).Add(TimeSpan.FromMinutes(14))); // started after cutoff, with no prior observation
+    ocean.Tick();
+
+    Equal(0, feesh.LaunchCalls, "late start does not launch into an expired window");
+    True(!h.Configuration.HandledOceanFishingWindowsUtc.Contains(new DateTimeOffset(2026, 10, 21, 10, 0, 0, TimeSpan.Zero)),
+        "unobserved historical window is not marked handled");
+    True(ocean.Admission!.Code != "MissedLaunchCutoff", "no retrospective missed-window diagnostic");
+}
+
+static void TestObservedFishingWindowMissedOnce()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    h.Configuration.AutomationSession!.OceanFishingEnabled = true;
+    var log = new RecordingWorkflowLog();
+    var feesh = new FakeFeesh(() => CreateIdleFeeshStatus(h.Clock.UtcNow));
+    using var ocean = new OceanFishingHandoffController(h.Configuration, () => { }, h.Game, h.Retainers,
+        h.Lifestream, feesh, () => true, () => true, log, h.Clock);
+
+    h.Clock.Advance(TimeSpan.FromMinutes(45));
+    ocean.Tick();
+    h.Clock.Advance(TimeSpan.FromMinutes(28));
+    ocean.Tick();
+    Equal("MissedLaunchCutoff", ocean.Admission!.Code, "actively observed window reports its missed cutoff");
+    Equal(1, log.WarningMessages.Count(message => message.Contains("MissedLaunchCutoff", StringComparison.Ordinal)),
+        "missed cutoff logs once");
+    ocean.Tick();
+    Equal(1, log.WarningMessages.Count(message => message.Contains("MissedLaunchCutoff", StringComparison.Ordinal)),
+        "subsequent ticks do not repeat missed cutoff warning");
+}
+
+static void TestFishingWaitDiagnosticsAreInformational()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    var log = new RecordingWorkflowLog();
+    var feesh = new FakeFeesh(() => CreateIdleFeeshStatus(h.Clock.UtcNow));
+    using var ocean = new OceanFishingHandoffController(h.Configuration, () => { }, h.Game, h.Retainers,
+        h.Lifestream, feesh, () => false, () => true, log, h.Clock);
+
+    ocean.Tick();
+    True(log.InformationMessages.Any(message => message.Contains("SessionInactive", StringComparison.Ordinal)),
+        "inactive fishing session is informational");
+    Equal(0, log.WarningMessages.Count, "inactive fishing session is not a warning");
+
+    h.Configuration.AutomationSession!.OceanFishingEnabled = true;
+    h.Clock.Advance(TimeSpan.FromMinutes(45));
+    using var ownedOcean = new OceanFishingHandoffController(h.Configuration, () => { }, h.Game, h.Retainers,
+        h.Lifestream, feesh, () => true, () => true, log, h.Clock);
+    ownedOcean.Tick();
+    True(log.InformationMessages.Any(message => message.Contains("DungeonOwnsActivity", StringComparison.Ordinal)),
+        "owned dungeon wait is informational");
+    Equal(0, log.WarningMessages.Count, "normal dungeon ownership wait is not a warning");
+
+    using var retainerOwnedOcean = new OceanFishingHandoffController(h.Configuration, () => { }, h.Game, h.Retainers,
+        h.Lifestream, feesh, () => false, () => true, log, h.Clock, () => true);
+    retainerOwnedOcean.Tick();
+    Equal("RetainerOwnsActivity", retainerOwnedOcean.Admission!.Code, "known retainer ownership uses a stable blocker");
+    True(log.InformationMessages.Any(message => message.Contains("RetainerOwnsActivity", StringComparison.Ordinal)),
+        "owned retainer wait is informational");
+    Equal(0, log.WarningMessages.Count, "normal retainer ownership wait is not a warning");
+}
+
+static void TestReloadRecoveryCanStop()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    h.Automation.RecoverAfterReload();
+    h.Farming.RecoverAfterReload();
+    h.Handoff.RecoverAfterReload();
+    h.Handoff.RefreshResumeReadiness();
+
+    True(h.Farming.AcknowledgeRecoveryAndStop(h.Handoff.CanResumeAutomationSession), "safe recovery stop is accepted independently");
+    Equal("RecoveryAcknowledged", h.Configuration.FarmingPlan!.State, "plan stop is acknowledged");
+    Equal("Stopped", h.Configuration.AutomationSession!.State, "parent automation is stopped");
+    Equal("Stopped", h.Configuration.RetainerSession!.State, "linked retainer session is stopped");
+}
+
+static void TestRecoveryStopPreservesFishingOwnership()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    h.Configuration.OceanFishingOperation = new OceanFishingOperationRecord
+    {
+        OperationId = "owned-ocean", SessionId = "session", State = "RecoveryRequired",
+        WindowStartUtc = h.Clock.UtcNow, LaunchIntentUtc = h.Clock.UtcNow,
+    };
+    h.Automation.RecoverAfterReload();
+    h.Farming.RecoverAfterReload();
+    h.Handoff.RecoverAfterReload();
+
+    True(!h.Farming.AcknowledgeRecoveryAndStop(true), "stop refuses to erase unresolved fishing ownership");
+    Equal("RecoveryRequired", h.Configuration.FarmingPlan!.State, "plan stays in recovery");
+    Equal("RecoveryRequired", h.Configuration.OceanFishingOperation!.State, "fishing operation is preserved");
+}
+
+static void TestAcknowledgedRecoveryAllowsNewPlan()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    var plan = h.Configuration.FarmingPlan!;
+    plan.State = "RecoveryAcknowledged";
+    plan.RecoveryKind = "AcknowledgedStop";
+    plan.StopRequested = true;
+
+    True(h.Farming.CanStart, "acknowledged plan can be replaced before weekly reset");
+}
+
+static WahToolsFeeshStatus CreateIdleFeeshStatus(DateTimeOffset now) => new(
+    true, now, "WahTools Feesh idle",
+    WahToolsFeeshStatus.NormalizeTripRunning(false, null), false, false, false, false, false, false,
+    "Idle", "Trip not initialized", "Idle", 1)
+{
+    TripInitialized = false,
+};
+
 static void TestVentureOutsideWait()
 {
     var h = new Harness(known: true, ready: false);
@@ -409,7 +604,7 @@ sealed class Harness
         }
         Dungeon = new DungeonRunController(Configuration, Save, AutoDuty, Retainers, Game, log,
             CheckEligibility,
-            () => new DebugTests.LiveTomeState(123, 49, WeeklyAcquired, 900, 100));
+            () => new DebugTests.LiveTomeState(123, 49, WeeklyAcquired, 900, 100), Clock);
         Farming = new FarmingPlanController(Configuration, Save, Dungeon, Game, Automation, log,
             () => new DebugTests.LiveTomeState(123, 49, WeeklyAcquired, 900, 100),
             CheckEligibility,
@@ -576,6 +771,19 @@ sealed class FakeLifestream(FakeGame game) : ILifestreamProvider
     }
 }
 
+sealed class FakeFeesh(Func<WahToolsFeeshStatus> readStatus) : IWahToolsFeeshClient
+{
+    public bool IsAvailable => true;
+    public int LaunchCalls { get; private set; }
+    public WahToolsFeeshStatus ReadStatus() => readStatus();
+    public FeeshRequestResult RequestSingleVoyage(out string detail)
+    {
+        LaunchCalls++;
+        detail = "Accepted";
+        return FeeshRequestResult.Accepted;
+    }
+}
+
 sealed class NullWorkflowLog : IWorkflowLog
 {
     public void Information(string message, params object[] values) { }
@@ -583,4 +791,16 @@ sealed class NullWorkflowLog : IWorkflowLog
     public void Warning(Exception exception, string message, params object[] values) { }
     public void Error(string message, params object[] values) { }
     public void Error(Exception exception, string message, params object[] values) { }
+}
+
+sealed class RecordingWorkflowLog : IWorkflowLog
+{
+    public List<string> InformationMessages { get; } = [];
+    public List<string> WarningMessages { get; } = [];
+    public void Information(string message, params object[] values) => InformationMessages.Add(Format(message, values));
+    public void Warning(string message, params object[] values) => WarningMessages.Add(Format(message, values));
+    public void Warning(Exception exception, string message, params object[] values) => WarningMessages.Add(Format(message, values));
+    public void Error(string message, params object[] values) { }
+    public void Error(Exception exception, string message, params object[] values) { }
+    private static string Format(string message, object[] values) => $"{message} {string.Join(" ", values)}";
 }

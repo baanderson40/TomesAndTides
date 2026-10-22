@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Text;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
@@ -9,15 +10,20 @@ namespace TomesAndTides.Windows;
 /// <summary>Manual one-run test controls, diagnostic runner, and detailed result viewer.</summary>
 public sealed class DebugWindow : Window
 {
+    private enum SelectedDiagnosticPanel { Test, ManualOneRun, AutomationState }
+
     private readonly DebugSession session;
     private readonly Configuration configuration;
     private readonly DungeonRunController dungeonRun;
     private readonly FarmingPlanController farmingPlan;
     private readonly RetainerHandoffController retainerHandoff;
+    private readonly AutomationSessionController automationSession;
+    private readonly OceanFishingHandoffController oceanFishing;
     private readonly Action saveConfiguration;
     private readonly IPluginLog log;
     private readonly Action openMain;
     private int selected;
+    private SelectedDiagnosticPanel selectedPanel;
     private bool confirmRun;
     private DebugTests.DungeonOption? confirmedDungeon;
     private DebugTests.DutyModeSelection confirmedMode;
@@ -28,6 +34,7 @@ public sealed class DebugWindow : Window
 
     public DebugWindow(DebugSession session, Configuration configuration, DungeonRunController dungeonRun,
         FarmingPlanController farmingPlan, RetainerHandoffController retainerHandoff,
+        AutomationSessionController automationSession, OceanFishingHandoffController oceanFishing,
         Action saveConfiguration, IPluginLog log, Action openMain)
         : base("Tomes & Tides — Diagnostics##TomesAndTidesDiagnostics", ImGuiWindowFlags.NoCollapse)
     {
@@ -36,6 +43,8 @@ public sealed class DebugWindow : Window
         this.dungeonRun = dungeonRun;
         this.farmingPlan = farmingPlan;
         this.retainerHandoff = retainerHandoff;
+        this.automationSession = automationSession;
+        this.oceanFishing = oceanFishing;
         this.saveConfiguration = saveConfiguration;
         this.log = log;
         this.openMain = openMain;
@@ -77,9 +86,6 @@ public sealed class DebugWindow : Window
             ImGui.TextWrapped("/tt is already in use. Open the main window with /tomestides.");
         ImGui.Separator();
 
-        DrawOneRunTest();
-        ImGui.Spacing();
-
         var height = Math.Max(1, ImGui.GetContentRegionAvail().Y - 4);
         if (!ImGui.BeginTable("DiagnosticsLayout", 2, ImGuiTableFlags.Resizable | ImGuiTableFlags.BordersInnerV))
             return;
@@ -92,6 +98,42 @@ public sealed class DebugWindow : Window
         DrawResults(height);
         ImGui.EndTable();
         DrawRunConfirmation();
+    }
+
+    private void DrawAutomationStateDebug()
+    {
+        ImGui.TextWrapped("AUTOMATION STATE DEBUG");
+        var plan = farmingPlan.Current;
+        var run = dungeonRun.Current;
+        var parent = automationSession.Current;
+        var retainerSession = retainerHandoff.Session;
+        var handoff = retainerHandoff.Handoff;
+        var fishing = oceanFishing.Current;
+        var sliderEnabled = farmingPlan.CanStart && run is null;
+        if (ImGui.Button("Output automation state to Dalamud log", new Vector2(-1, 0)))
+        {
+            var output = new StringBuilder()
+                .AppendLine("Tomes & Tides automation state (cached; no provider calls)")
+                .AppendLine($"Captured UTC: {DateTimeOffset.UtcNow:O}")
+                .AppendLine($"Finish-period slider: {(sliderEnabled ? "enabled" : "disabled")}; FarmingPlan.CanStart={farmingPlan.CanStart}; dungeon run present={run is not null}")
+                .AppendLine($"Saved finish periods: config={configuration.FarmingPeriodsToUse}; plan={plan?.RequestedPeriodCount.ToString() ?? "none"}")
+                .AppendLine($"Plan finish deadline UTC: {plan?.FinishDeadlineUtc.ToString("O") ?? "none"}; weekly reset UTC: {plan?.WeeklyResetUtc.ToString("O") ?? "none"}")
+                .AppendLine($"Start action: plan={plan?.State ?? "none"}; parent session={parent?.State ?? "none"}; dungeon run={run?.State ?? "none"}; retainer owns={retainerHandoff.OwnsActivity}; fishing owns={oceanFishing.OwnsActivity}")
+                .AppendLine($"Parent session: state={parent?.State ?? "none"}; recovery={parent?.RecoveryKind ?? "none"}; stopRequested={parent?.StopRequested.ToString() ?? "n/a"}; detail={parent?.Detail ?? "none"}")
+                .AppendLine($"Farming plan: state={plan?.State ?? "none"}; recovery={plan?.RecoveryKind ?? "none"}; stopRequested={plan?.StopRequested.ToString() ?? "n/a"}; detail={plan?.Detail ?? "none"}")
+                .AppendLine($"Dungeon run: state={run?.State ?? "none"}; reward={run?.RewardOutcome ?? "n/a"}; detail={run?.Detail ?? "none"}")
+                .AppendLine($"Retainer session: state={retainerSession?.State ?? "none"}; recovery={retainerSession?.RecoveryKind ?? "none"}; stopRequested={retainerSession?.StopRequested.ToString() ?? "n/a"}; detail={retainerSession?.Detail ?? "none"}")
+                .AppendLine($"Retainer handoff: state={handoff?.State ?? "none"}; recovery={handoff?.RecoveryKind ?? "none"}; detail={handoff?.Detail ?? "none"}")
+                .AppendLine($"Ocean Fishing: state={fishing?.State ?? "none"}; recovery={fishing?.RecoveryKind ?? "none"}; detail={fishing?.Detail ?? "none"}")
+                .AppendLine($"Ocean Fishing admission: {oceanFishing.Admission?.Code ?? "none"}; {oceanFishing.Admission?.Detail ?? "no cached admission diagnostic"}")
+                .AppendLine($"Resume readiness (cached): plan={farmingPlan.CanResumeAfterReload}; retainers={retainerHandoff.CanResumeAutomationSession}; fishing={oceanFishing.CanResumeAutomationSession}")
+                .ToString();
+            log.Information("Automation state debug output (cached; no provider calls):\n{AutomationState}", output);
+            actionMessage = "Cached automation state written to the Dalamud log. Character IDs are not included.";
+        }
+        TextDisabledWrapped("Writes cached controller states, recovery reasons, and the finish-slider gate to the Dalamud log. No providers are queried and character IDs are omitted.");
+        if (!string.IsNullOrWhiteSpace(actionMessage))
+            TextColoredWrapped(TomesTheme.Amber, actionMessage);
     }
 
     private void DrawOneRunTest()
@@ -188,10 +230,26 @@ public sealed class DebugWindow : Window
         ImGui.TextWrapped("Debug tests");
         ImGui.Separator();
         for (var index = 0; index < session.Tests.Count; index++)
-            if (ImGui.Selectable(session.Tests[index].Name, selected == index))
+            if (ImGui.Selectable(session.Tests[index].Name,
+                    selectedPanel == SelectedDiagnosticPanel.Test && selected == index))
+            {
                 selected = index;
+                selectedPanel = SelectedDiagnosticPanel.Test;
+            }
+        if (ImGui.Selectable("Manual one-run test", selectedPanel == SelectedDiagnosticPanel.ManualOneRun))
+            selectedPanel = SelectedDiagnosticPanel.ManualOneRun;
+        if (ImGui.Selectable("Automation state", selectedPanel == SelectedDiagnosticPanel.AutomationState))
+            selectedPanel = SelectedDiagnosticPanel.AutomationState;
 
         ImGui.Spacing();
+        if (selectedPanel != SelectedDiagnosticPanel.Test)
+        {
+            ImGui.TextWrapped(selectedPanel == SelectedDiagnosticPanel.ManualOneRun
+                ? "Explicitly request one AutoDuty dungeon run after fresh validation."
+                : "Copy cached automation and recovery state for troubleshooting.");
+            ImGui.EndChild();
+            return;
+        }
         ImGui.TextWrapped(session.Tests[selected].Description);
         if (session.Tests[selected].Name is "Dungeon eligibility" or "AutoDuty launch readiness")
             DrawEligibilitySelection();
@@ -266,8 +324,25 @@ public sealed class DebugWindow : Window
             ImGui.EndChild();
             return;
         }
-        ImGui.TextWrapped(session.Tests[selected].Name);
+        ImGui.TextWrapped(selectedPanel switch
+        {
+            SelectedDiagnosticPanel.ManualOneRun => "Manual one-run test",
+            SelectedDiagnosticPanel.AutomationState => "Automation state",
+            _ => session.Tests[selected].Name,
+        });
         ImGui.Separator();
+        if (selectedPanel == SelectedDiagnosticPanel.ManualOneRun)
+        {
+            DrawOneRunTest();
+            ImGui.EndChild();
+            return;
+        }
+        if (selectedPanel == SelectedDiagnosticPanel.AutomationState)
+        {
+            DrawAutomationStateDebug();
+            ImGui.EndChild();
+            return;
+        }
         if (session.GetResult(selected) is { } result)
         {
             var stale = result.SelectionFingerprint is not null &&

@@ -4,6 +4,7 @@ using Dalamud.IoC;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Dalamud.Game.ClientState.Conditions;
+using ECommons;
 using TomesAndTides.Debugging;
 using TomesAndTides.Windows;
 using TomesAndTides.Integrations;
@@ -47,17 +48,36 @@ public sealed class Plugin : IDalamudPlugin
     private readonly bool aliasRegistered;
     private DateTimeOffset nextDashboardRefreshUtc;
     private readonly IWorkflowLog workflowLog;
+    private bool ecommonsInitialized;
+    private bool mainCommandRegistered;
 
     public Plugin()
     {
         var loadedUtc = DateTimeOffset.UtcNow;
+        try
+        {
+            ECommonsMain.Init(PluginInterface, this, Module.DalamudReflector);
+            ecommonsInitialized = true;
+        }
+        catch (Exception error)
+        {
+            Log.Error(error, "ECommons initialization failed; plugin integrations cannot be initialized safely.");
+            try { ECommonsMain.Dispose(); }
+            catch (Exception disposeError) { Log.Error(disposeError, "ECommons cleanup after failed initialization also failed."); }
+            throw;
+        }
+
+        try
+        {
         configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         workflowLog = new DalamudWorkflowLog(Log);
         autoRetainer = new AutoRetainerClient(PluginInterface, Log);
         autoDuty = new AutoDutyClient(PluginInterface);
         gameState = new DalamudWorkflowGameState(Client, Objects, PlayerState, Conditions, DutyState);
         automationSession = new AutomationSessionController(configuration, SaveConfiguration, workflowLog);
-        var debugTests = new DebugTests(Data, Client, Objects, PluginInterface, Unlocks, PlayerState, Conditions, configuration);
+        var feeshStatusReader = new WahToolsFeeshStatusReader(PluginInterface, workflowLog);
+        var debugTests = new DebugTests(Data, Client, Objects, PluginInterface, Unlocks, PlayerState, Conditions,
+            configuration, feeshStatusReader);
         session = new DebugSession(debugTests, Log);
         dungeonRun = new DungeonRunController(configuration, SaveConfiguration, autoDuty, autoRetainer,
             gameState, workflowLog, debugTests.CheckEligibility,
@@ -69,10 +89,11 @@ public sealed class Plugin : IDalamudPlugin
         retainerHandoff = new RetainerHandoffController(configuration, SaveConfiguration, autoRetainer, lifestream,
             gameState, dungeonRun, farmingPlan,
             () => retainerReadiness, RefreshRetainerReadiness, debugTests.ReadAutoDutyStopped, workflowLog);
-        var feesh = new WahToolsFeeshClient(PluginInterface, new WahToolsFeeshStatusReader(workflowLog), workflowLog);
+        var feesh = new WahToolsFeeshClient(PluginInterface, feeshStatusReader, workflowLog);
         oceanFishing = new OceanFishingHandoffController(configuration, SaveConfiguration, gameState,
             autoRetainer, lifestream, feesh, () => dungeonRun.Current is not null,
-            debugTests.ReadAutoDutyStopped, workflowLog);
+            debugTests.ReadAutoDutyStopped, workflowLog,
+            retainerOperationOwned: () => retainerHandoff.OwnsActivity);
         retainerHandoff.Subscribe();
         automationSession.RecoverAfterReload();
         farmingPlan.RecoverAfterReload();
@@ -82,10 +103,12 @@ public sealed class Plugin : IDalamudPlugin
             () => retainerReadiness, retainerHandoff, automationSession, oceanFishing,
             () => (retainerRosterKnown, retainerRoster));
         debugWindow = new DebugWindow(session, configuration, dungeonRun, farmingPlan, retainerHandoff,
+            automationSession, oceanFishing,
             SaveConfiguration, Log, OpenMain);
         if (!Commands.AddHandler(MainCommand, new CommandInfo(OnCommand)
             { HelpMessage = "Open the Tomes & Tides main window." }))
             throw new InvalidOperationException($"Command {MainCommand} is already registered.");
+        mainCommandRegistered = true;
 
         aliasRegistered = Commands.AddHandler(Alias, new CommandInfo(OnCommand)
             { HelpMessage = $"Alias for {MainCommand}.", ShowInHelp = false });
@@ -101,6 +124,32 @@ public sealed class Plugin : IDalamudPlugin
         Framework.Update += OnUpdate;
         Log.Information("Tomes & Tides plugin loaded at {LoadedUtc:O}; build={BuildVersion}.",
             loadedUtc, typeof(Plugin).Assembly.GetName().Version?.ToString() ?? "unknown");
+        }
+        catch (Exception error)
+        {
+            Framework.Update -= OnUpdate;
+            PluginInterface.UiBuilder.Draw -= windows.Draw;
+            PluginInterface.UiBuilder.OpenMainUi -= OpenMain;
+            PluginInterface.UiBuilder.OpenConfigUi -= OpenMain;
+            if (aliasRegistered)
+                Commands.RemoveHandler(Alias);
+            if (mainCommandRegistered)
+                Commands.RemoveHandler(MainCommand);
+            dungeonRun?.Dispose();
+            retainerHandoff?.Dispose();
+            oceanFishing?.Dispose();
+            autoRetainer?.Dispose();
+            gameState?.Dispose();
+            windows.RemoveAllWindows();
+            if (ecommonsInitialized)
+            {
+                try { ECommonsMain.Dispose(); }
+                catch (Exception disposeError) { Log.Error(disposeError, "ECommons cleanup after plugin initialization failure also failed."); }
+                ecommonsInitialized = false;
+            }
+            Log.Error(error, "Tomes & Tides failed during initialization; initialized resources were cleaned up.");
+            throw;
+        }
     }
 
     public void Dispose()
@@ -118,6 +167,11 @@ public sealed class Plugin : IDalamudPlugin
         autoRetainer.Dispose();
         gameState.Dispose();
         windows.RemoveAllWindows();
+        if (ecommonsInitialized)
+        {
+            ECommonsMain.Dispose();
+            ecommonsInitialized = false;
+        }
     }
 
     private void OnUpdate(IFramework framework)

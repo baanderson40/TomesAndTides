@@ -3,6 +3,21 @@ namespace TomesAndTides.Debugging;
 public readonly record struct OceanFishingWindow(DateTimeOffset StartUtc, DateTimeOffset RegistrationEndUtc,
     DateTimeOffset LaunchCutoffUtc, DateTimeOffset PreparationStartUtc);
 
+public sealed record OceanFishingAdmissionDiagnostic(
+    DateTimeOffset ObservedUtc,
+    DateTimeOffset? WindowStartUtc,
+    DateTimeOffset? LaunchCutoffUtc,
+    string Code,
+    string Detail,
+    bool? PlayerSafe,
+    bool? AutoDutyStopped,
+    bool? AutoRetainerBusy,
+    bool? AutoRetainerMultiMode,
+    bool? LifestreamBusy,
+    bool? WahToolsAvailable,
+    bool? FeeshClean,
+    string? FeeshDetail);
+
 public static class OceanFishingSchedulePolicy
 {
     public static readonly TimeSpan RegistrationLength = TimeSpan.FromMinutes(15);
