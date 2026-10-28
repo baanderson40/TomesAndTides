@@ -94,6 +94,16 @@ var tests = new (string Name, Action Run)[]
             !periods.Select(period => period.AllocatedRuns).SequenceEqual([3, 3, 2]))
             throw new InvalidOperationException("Current-period allocation mismatch.");
     }),
+    ("current checklist allocates only its period share", () =>
+    {
+        var start = new DateTimeOffset(2026, 10, 27, 8, 0, 0, TimeSpan.Zero);
+        if (FarmingSchedulePolicy.CurrentPeriodTarget(12, start, start.AddDays(4)) != 3 ||
+            FarmingSchedulePolicy.CurrentPeriodTarget(10, start.AddDays(2), start.AddDays(4)) != 5 ||
+            FarmingSchedulePolicy.CurrentPeriodTarget(5, start, start.AddDays(1)) != 5 ||
+            FarmingSchedulePolicy.CurrentPeriodTarget(0, start, start.AddDays(4)) != 0 ||
+            FarmingSchedulePolicy.CurrentPeriodTarget(5, start, start) != 0)
+            throw new InvalidOperationException("Current-period checklist target mismatch.");
+    }),
     ("missed periods redistribute from current period", () =>
     {
         var weekStart = new DateTimeOffset(2026, 10, 20, 8, 0, 0, TimeSpan.Zero);
@@ -176,6 +186,22 @@ var tests = new (string Name, Action Run)[]
         if (!Wait(300, 5) || Wait(301, 5) || Wait(1, 0) || !Wait(0, 0) ||
             Wait(60, 31) || Wait(60, 5, known: false) || Wait(60, 5, ready: true) || Wait(null, 5))
             throw new InvalidOperationException("Near-complete venture wait threshold policy mismatch.");
+    }),
+    ("Ocean Fishing boarding deadline preserves full post-launch timeout", () =>
+    {
+        var windowStart = new DateTimeOffset(2026, 10, 24, 8, 0, 0, TimeSpan.Zero);
+        var launch = new DateTimeOffset(2026, 10, 24, 7, 40, 20, TimeSpan.Zero);
+        var expected = new DateTimeOffset(2026, 10, 24, 8, 20, 0, TimeSpan.Zero);
+        if (OceanFishingSchedulePolicy.GetBoardingDeadlineUtc(windowStart, launch) != expected)
+            throw new InvalidOperationException("Early launch deadline must extend five minutes beyond registration end.");
+    }),
+    ("Ocean Fishing later launch keeps launch-relative timeout", () =>
+    {
+        var windowStart = new DateTimeOffset(2026, 10, 24, 8, 0, 0, TimeSpan.Zero);
+        var launch = new DateTimeOffset(2026, 10, 24, 8, 12, 0, TimeSpan.Zero);
+        var expected = new DateTimeOffset(2026, 10, 24, 8, 42, 0, TimeSpan.Zero);
+        if (OceanFishingSchedulePolicy.GetBoardingDeadlineUtc(windowStart, launch) != expected)
+            throw new InvalidOperationException("Later launch deadline must retain 30-minute allowance.");
     }),
     ("return verification deadline is bounded and starts at phase transition", () =>
     {

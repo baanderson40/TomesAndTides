@@ -11,5 +11,6 @@
     <Compile Include="../TomesAndTides/Debugging/SingleRunPolicy.cs" Link="SingleRunPolicy.cs" />
     <Compile Include="../TomesAndTides/Debugging/FarmingSchedulePolicy.cs" Link="FarmingSchedulePolicy.cs" />
     <Compile Include="../TomesAndTides/Debugging/RetainerHandoffPolicy.cs" Link="RetainerHandoffPolicy.cs" />
+    <Compile Include="../TomesAndTides/Debugging/OceanFishingPolicy.cs" Link="OceanFishingPolicy.cs" />
   </ItemGroup>
 </Project>

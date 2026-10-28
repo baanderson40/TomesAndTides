@@ -9,6 +9,7 @@ public interface IRetainerProvider
     RetainerReadinessSnapshot ReadReadiness(ulong currentCharacterContentId = 0);
     bool TryGetRegisteredCharacters(out IReadOnlyList<RetainerCharacterIdentity> characters);
     void RequestSingleRetainerPass();
+    bool TryCancelOwnedPass(out string detail);
 }
 
 public sealed record RetainerCharacterIdentity(ulong ContentId, string Name, string World);

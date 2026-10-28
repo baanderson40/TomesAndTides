@@ -1,6 +1,6 @@
 namespace TomesAndTides.Debugging;
 
-/// <summary>Pure UTC period calculations for the manually started weekly farming plan.</summary>
+/// <summary>Pure UTC reset/period calculations for continuous scheduling and current-period checklists.</summary>
 public static class FarmingSchedulePolicy
 {
     public enum QueueDecision { Queue, PlanStopped, DeadlineReached, PeriodComplete }
@@ -44,6 +44,21 @@ public static class FarmingSchedulePolicy
             throw new ArgumentOutOfRangeException(nameof(reward), "Weekly counts, cap, and reward must be valid.");
         var remaining = Math.Max(0, weeklyLimit - weeklyAcquired);
         return remaining == 0 ? 0 : checked((remaining + reward - 1) / reward);
+    }
+
+    /// <summary>Runs for one current period; future periods are not allocated or persisted.</summary>
+    public static int CurrentPeriodTarget(int remainingRuns, DateTimeOffset currentPeriodStartUtc,
+        DateTimeOffset finishBoundaryUtc)
+    {
+        if (remainingRuns < 0)
+            throw new ArgumentOutOfRangeException(nameof(remainingRuns));
+        currentPeriodStartUtc = currentPeriodStartUtc.ToUniversalTime();
+        finishBoundaryUtc = finishBoundaryUtc.ToUniversalTime();
+        if (finishBoundaryUtc <= currentPeriodStartUtc)
+            return 0;
+        var periodsRemaining = checked((int)Math.Ceiling(
+            (finishBoundaryUtc - currentPeriodStartUtc).Ticks / (double)PeriodLength.Ticks));
+        return remainingRuns == 0 ? 0 : checked((remainingRuns + periodsRemaining - 1) / periodsRemaining);
     }
 
     public static bool ShouldCreditOperation(string operationId, IReadOnlyCollection<string> creditedOperationIds) =>

@@ -11,6 +11,7 @@ public interface IWahToolsFeeshClient
     bool IsAvailable { get; }
     WahToolsFeeshStatus ReadStatus();
     FeeshRequestResult RequestSingleVoyage(out string detail);
+    FeeshRequestResult Stop(out string detail);
 }
 
 public sealed class WahToolsFeeshClient(IDalamudPluginInterface pluginInterface,
@@ -18,6 +19,7 @@ public sealed class WahToolsFeeshClient(IDalamudPluginInterface pluginInterface,
 {
     private readonly ICallGateSubscriber<bool, bool> autoOcean = pluginInterface.GetIpcSubscriber<bool, bool>("WahTools.Feesh.AutoOcean");
     private readonly ICallGateSubscriber<bool> catchTheBoat = pluginInterface.GetIpcSubscriber<bool>("WahTools.Feesh.CatchTheBoat");
+    private readonly ICallGateSubscriber<bool> stop = pluginInterface.GetIpcSubscriber<bool>("WahTools.Feesh.Stop");
 
     public bool IsAvailable => pluginInterface.InstalledPlugins.Any(plugin =>
         string.Equals(plugin.InternalName, "WahTools", StringComparison.OrdinalIgnoreCase) && plugin.IsLoaded);
@@ -51,6 +53,22 @@ public sealed class WahToolsFeeshClient(IDalamudPluginInterface pluginInterface,
         {
             detail = $"CatchTheBoat outcome is ambiguous: {error.GetBaseException().Message}";
             log.Warning(error, "WahTools CatchTheBoat outcome is ambiguous; request will not be repeated.");
+            return FeeshRequestResult.Unavailable;
+        }
+    }
+
+    public FeeshRequestResult Stop(out string detail)
+    {
+        try
+        {
+            var accepted = stop.InvokeFunc();
+            detail = accepted ? "WahTools Feesh Stop accepted." : "WahTools Feesh refused Stop.";
+            return accepted ? FeeshRequestResult.Accepted : FeeshRequestResult.Refused;
+        }
+        catch (Exception error)
+        {
+            detail = $"WahTools Feesh Stop outcome unavailable: {error.GetBaseException().Message}";
+            log.Warning(error, "WahTools Feesh Stop failed; provider may still be running.");
             return FeeshRequestResult.Unavailable;
         }
     }

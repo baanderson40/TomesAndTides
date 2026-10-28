@@ -109,7 +109,19 @@ public sealed class DebugWindow : Window
         var retainerSession = retainerHandoff.Session;
         var handoff = retainerHandoff.Handoff;
         var fishing = oceanFishing.Current;
+        var currentChecklist = farmingPlan.CurrentChecklist;
         var sliderEnabled = farmingPlan.CanStart && run is null;
+        var schedulerPeriod = plan is null
+            ? "none"
+            : FarmingSchedulePolicy.GetPeriodStartUtc(DateTimeOffset.UtcNow, plan.WeekStartUtc).ToString("O");
+        var checklistSummary = currentChecklist is null
+            ? "none"
+            : $"{currentChecklist.StartUtc:O} {currentChecklist.CompletedRuns}/{currentChecklist.AllocatedRuns}";
+        var activeRunCredited = run is not null && plan?.CreditedOperationIds.Contains(run.OperationId) == true;
+        var schedulerStart = plan is null
+            ? (DateTimeOffset?)null
+            : FarmingSchedulePolicy.GetPeriodStartUtc(DateTimeOffset.UtcNow, plan.WeekStartUtc);
+        var checklistPointerMismatch = schedulerStart is { } currentStart && plan?.CurrentPeriodStartUtc != currentStart;
         if (ImGui.Button("Output automation state to Dalamud log", new Vector2(-1, 0)))
         {
             var output = new StringBuilder()
@@ -118,6 +130,11 @@ public sealed class DebugWindow : Window
                 .AppendLine($"Finish-period slider: {(sliderEnabled ? "enabled" : "disabled")}; FarmingPlan.CanStart={farmingPlan.CanStart}; dungeon run present={run is not null}")
                 .AppendLine($"Saved finish periods: config={configuration.FarmingPeriodsToUse}; plan={plan?.RequestedPeriodCount.ToString() ?? "none"}")
                 .AppendLine($"Plan finish deadline UTC: {plan?.FinishDeadlineUtc.ToString("O") ?? "none"}; weekly reset UTC: {plan?.WeeklyResetUtc.ToString("O") ?? "none"}")
+                .AppendLine($"Scheduler UTC period: {schedulerPeriod}")
+                .AppendLine($"Saved checklist pointer: {plan?.CurrentPeriodStartUtc?.ToString("O") ?? "none"}; displayed current checklist: {checklistSummary}")
+                .AppendLine($"Checklist pointer differs from scheduler period={checklistPointerMismatch}")
+                .AppendLine($"Active run period: {run?.FarmingPeriodStartUtc?.ToString("O") ?? "none"}; linked operation={run?.OperationId ?? "none"}; already credited={activeRunCredited}")
+                .AppendLine($"Persisted period-record count: {plan?.Periods.Count ?? 0}")
                 .AppendLine($"Start action: plan={plan?.State ?? "none"}; parent session={parent?.State ?? "none"}; dungeon run={run?.State ?? "none"}; retainer owns={retainerHandoff.OwnsActivity}; fishing owns={oceanFishing.OwnsActivity}")
                 .AppendLine($"Parent session: state={parent?.State ?? "none"}; recovery={parent?.RecoveryKind ?? "none"}; stopRequested={parent?.StopRequested.ToString() ?? "n/a"}; detail={parent?.Detail ?? "none"}")
                 .AppendLine($"Farming plan: state={plan?.State ?? "none"}; recovery={plan?.RecoveryKind ?? "none"}; stopRequested={plan?.StopRequested.ToString() ?? "n/a"}; detail={plan?.Detail ?? "none"}")
@@ -194,8 +211,8 @@ public sealed class DebugWindow : Window
             return;
         var dungeon = confirmedDungeon!;
         ImGui.TextWrapped($"Dungeon: {dungeon.Name}\nMode: {confirmedMode}\nExpected full-clear reward: {dungeon.Reward}\nbareMode: {confirmedBareMode}");
-        ImGui.TextWrapped("AutoDuty must already be stopped, Looping, configured for one loop, and set to this mode. TT rechecks eligibility before its single request.");
-        ImGui.TextWrapped("Keep other integrations from controlling AutoDuty or pushing overrides until the run is safely acknowledged. TT will not write AutoDuty settings or push/pop overrides.");
+        ImGui.TextWrapped("AutoDuty must be stopped before launch. TT sets the selected duty mode and requests one loop automatically; these settings persist after the run. TT rechecks eligibility before dispatch.");
+        ImGui.TextWrapped("TT updates the selected duty mode and AutoDuty.Run selects Looping mode with one loop. TT never pushes or pops global config overrides. Keep other integrations from controlling AutoDuty or pushing overrides until the run is safely acknowledged.");
         if (!confirmedBareMode)
             TextColoredWrapped(TomesTheme.Amber, "Warning: configured AutoDuty termination actions may log out or close the client.");
         ImGui.Separator();

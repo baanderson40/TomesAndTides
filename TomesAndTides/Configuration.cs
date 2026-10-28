@@ -24,8 +24,11 @@ public sealed class Configuration : IPluginConfiguration
     public RetainerAutomationSessionRecord? RetainerSession { get; set; }
     public RetainerHandoffRecord? RetainerHandoff { get; set; }
     public DungeonRunRecord? DungeonRun { get; set; }
+    public List<DungeonRunRecord> CancelledDungeonRuns { get; set; } = [];
     public FarmingPlanRecord? FarmingPlan { get; set; }
     public List<FarmingPlanRecord> FarmingPlanHistory { get; set; } = [];
+    public List<RetainerHandoffRecord> CancelledRetainerHandoffs { get; set; } = [];
+    public List<OceanFishingOperationRecord> CancelledOceanFishingOperations { get; set; } = [];
 }
 
 public sealed class AutomationSessionRecord
@@ -68,6 +71,7 @@ public sealed class OceanFishingOperationRecord
     public DateTimeOffset? LaunchIntentUtc { get; set; }
     public DateTimeOffset? ReturnIntentUtc { get; set; }
     public bool LaunchAmbiguous { get; set; }
+    public bool LaunchAccepted { get; set; }
     public bool DutyStarted { get; set; }
     public bool DutyCompleted { get; set; }
     public bool OceanTerritoryEntered { get; set; }

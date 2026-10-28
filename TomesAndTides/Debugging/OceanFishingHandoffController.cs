@@ -9,7 +9,6 @@ public sealed class OceanFishingHandoffController : IDisposable
     private static readonly TimeSpan StableCleanup = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan StableReturn = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan CharacterTimeout = TimeSpan.FromMinutes(10);
-    private static readonly TimeSpan BoardingTimeout = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan VoyageTimeout = TimeSpan.FromHours(2);
     private static readonly TimeSpan ReturnTimeout = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan CleanupTimeout = TimeSpan.FromMinutes(15);
@@ -33,8 +32,12 @@ public sealed class OceanFishingHandoffController : IDisposable
     private DateTimeOffset nextProviderPollUtc;
     private bool sawOceanTerritory;
     private bool disposed;
+    private bool launchAcceptedThisRuntime;
+    private bool lifestreamRequestIssuedThisRuntime;
     private OceanFishingAdmissionDiagnostic? admission;
     private DateTimeOffset? observedEligibleWindowStartUtc;
+    private DateTimeOffset nextRecoverySafetyCheckUtc;
+    private bool acknowledgeRecoveryRequested;
     private IReadOnlyList<RetainerCharacterIdentity> fishingRoster = [];
     private bool fishingRosterAvailable;
     private DateTimeOffset nextFishingRosterReadUtc;
@@ -62,8 +65,11 @@ public sealed class OceanFishingHandoffController : IDisposable
 
     public OceanFishingOperationRecord? Current => configuration.OceanFishingOperation;
     public OceanFishingAdmissionDiagnostic? Admission => admission;
-    public bool OwnsActivity => Current is { State: not ("Completed" or "Skipped" or "RecoveryAcknowledged") };
+    public bool OwnsActivity => Current is { State: not ("Completed" or "Skipped" or "RecoveryAcknowledged" or "CancelledByUser") };
     public bool NeedsRecovery => Current is { State: "RecoveryRequired" };
+    public bool CanAcknowledgeRecovery { get; private set; }
+    public bool RecoveryAcknowledgementPending => acknowledgeRecoveryRequested;
+    public string RecoveryAcknowledgementStatus { get; private set; } = "Recovery safety has not yet been checked on the framework thread.";
     public bool PrioritizesNow
     {
         get
@@ -102,29 +108,116 @@ public sealed class OceanFishingHandoffController : IDisposable
 
     public void RecoverAfterReload()
     {
+        if (Current is { } pendingStop &&
+            (pendingStop.RecoveryKind == "ManualStop" || pendingStop.State == "ManualStopPending"))
+        {
+            pendingStop.State = "CancelledByUser";
+            pendingStop.RecoveryKind = null;
+            pendingStop.Detail = "Manual Stop was persisted before reload; WahTools cancellation outcome is unknown. Verify provider state before starting again.";
+            pendingStop.PhaseChangedUtc = clock.UtcNow;
+            if (pendingStop.LaunchIntentUtc is not null)
+            {
+                configuration.HandledOceanFishingWindowsUtc ??= [];
+                if (!configuration.HandledOceanFishingWindowsUtc.Contains(pendingStop.WindowStartUtc))
+                    configuration.HandledOceanFishingWindowsUtc.Add(pendingStop.WindowStartUtc);
+            }
+            configuration.CancelledOceanFishingOperations ??= [];
+            configuration.CancelledOceanFishingOperations.Add(pendingStop);
+            configuration.OceanFishingOperation = null;
+            try { save(); }
+            catch (Exception error)
+            {
+                log.Error(error, "Could not persist Ocean Fishing manual Stop recovery; provider requests remain blocked.");
+            }
+            return;
+        }
         if (Current is not { State: not ("Completed" or "Skipped" or "RecoveryAcknowledged") } operation)
             return;
+        if (operation.State is "AwaitingBoarding" or "VoyageRunning" or "WaitingForDutyExit" or
+            "WaitingForProviderCleanup" or "AwaitingFarmingCharacter" or "VerifyingReturn")
+            operation.LaunchAccepted = true;
         operation.State = "RecoveryRequired";
         operation.RecoveryKind = "Reload";
         operation.Detail = "Plugin reloaded during an Ocean Fishing handoff. Inspect Feesh and character state; no provider request will be replayed.";
         operation.PhaseChangedUtc = clock.UtcNow;
         SetSessionRecovery(operation, "Ocean Fishing handoff requires explicit recovery after reload.");
         SaveOrRecover("Ocean Fishing reload recovery");
+        if (operation.RecoveryKind != "PersistenceFailure")
+            PublishRecoveryDiagnostic(operation);
     }
 
-    public bool AcknowledgeRecoveryAndStop()
+    /// <summary>Queue the user's recovery acknowledgment for safe validation on the next framework tick.</summary>
+    public bool RequestRecoveryAcknowledgement()
     {
-        if (!NeedsRecovery || Current is not { } operation || !MatchesFarmingCharacter(operation) ||
-            !gameState.IsSafePlayerState || IsOceanTerritory(gameState.TerritoryType) || readAutoDutyStopped() != true ||
-            !autoRetainer.TryGetProviderState(out var retainerBusy, out var retainerActive) || retainerBusy || retainerActive ||
-            !lifestream.TryGetBusy(out var lifestreamBusy) || lifestreamBusy)
+        if (!NeedsRecovery)
             return false;
-        var status = feesh.ReadStatus();
-        if (!status.IsClean || clock.UtcNow - status.ObservedUtc > StatusFreshness)
+        acknowledgeRecoveryRequested = true;
+        RecoveryAcknowledgementStatus = "Acknowledgment queued; checking safe return and provider state on the framework thread.";
+        return true;
+    }
+
+    public IReadOnlyList<string> CancelOwnedProviderWorkForManualStop()
+    {
+        var warnings = new List<string>();
+        if (launchAcceptedThisRuntime || Current is { LaunchAccepted: true })
+        {
+            var result = feesh.Stop(out var detail);
+            if (result != FeeshRequestResult.Accepted)
+                warnings.Add($"WahTools may still be running: {detail}");
+            else
+            {
+                var status = feesh.ReadStatus();
+                if (!status.Available || !status.IsClean)
+                    warnings.Add("WahTools Stop was accepted, but clean/idle status is not confirmed; provider work may continue.");
+            }
+        }
+        else if (Current is { LaunchIntentUtc: not null } operation && OwnsActivity)
+            warnings.Add("WahTools may still be running; launch acceptance cannot be confirmed from this runtime, so Stop was not sent.");
+        if (lifestreamRequestIssuedThisRuntime)
+        {
+            if (!lifestream.TryAbortOwnedRequest(out var detail))
+                warnings.Add($"Lifestream travel may still be running: {detail}");
+            else if (!lifestream.TryGetBusy(out var busy) || busy)
+                warnings.Add("Lifestream Abort was requested, but idle state is not confirmed.");
+        }
+        else if (Current is { State: "AwaitingFishingCharacter" or "AwaitingFarmingCharacter" or "ReturnIntentRecorded" or "OutboundIntentRecorded" })
+            warnings.Add("Lifestream travel may still be running after reload; TT cannot confirm this runtime owns the request.");
+        return warnings;
+    }
+
+    public void CompleteManualStop(string detail)
+    {
+        if (Current is { } operation && OwnsActivity)
+        {
+            operation.State = "CancelledByUser";
+            operation.RecoveryKind = null;
+            operation.Detail = detail;
+            operation.PhaseChangedUtc = clock.UtcNow;
+            if (operation.LaunchIntentUtc is not null)
+            {
+                configuration.HandledOceanFishingWindowsUtc ??= [];
+                if (!configuration.HandledOceanFishingWindowsUtc.Contains(operation.WindowStartUtc))
+                    configuration.HandledOceanFishingWindowsUtc.Add(operation.WindowStartUtc);
+            }
+            configuration.CancelledOceanFishingOperations ??= [];
+            configuration.CancelledOceanFishingOperations.Add(operation);
+            configuration.OceanFishingOperation = null;
+            PublishDiagnostic("CancelledByUser", detail, operation.WindowStartUtc,
+                operation.WindowStartUtc.Add(OceanFishingSchedulePolicy.LaunchCutoffOffset), information: true);
+        }
+        acknowledgeRecoveryRequested = false;
+        CanAcknowledgeRecovery = false;
+        launchAcceptedThisRuntime = false;
+        lifestreamRequestIssuedThisRuntime = false;
+    }
+
+    private bool AcknowledgeRecoveryAndStop()
+    {
+        if (!CanAcknowledgeRecovery || Current is not { } operation)
             return false;
         operation.State = "RecoveryAcknowledged";
         operation.RecoveryKind = null;
-        operation.Detail = "User verified farming character and all providers idle; ambiguous voyage was not replayed.";
+        operation.Detail = "User acknowledged the ambiguous voyage after TT verified the farming character and all providers idle; voyage was not replayed.";
         operation.PhaseChangedUtc = clock.UtcNow;
         configuration.HandledOceanFishingWindowsUtc ??= [];
         if (!configuration.HandledOceanFishingWindowsUtc.Contains(operation.WindowStartUtc))
@@ -135,9 +228,32 @@ public sealed class OceanFishingHandoffController : IDisposable
             session.StopRequested = true;
             session.RecoveryKind = null;
             session.Detail = "Recovery acknowledged and automation stopped. Start a new session explicitly to resume.";
+            if (configuration.FarmingPlan is { } plan && plan.PlanId == session.FarmingPlanId &&
+                plan.State is "Active" or "StopRequested")
+            {
+                plan.State = "Stopped";
+                plan.StopRequested = true;
+                plan.Detail = "Stopped after Ocean Fishing recovery acknowledgment; period ledger preserved.";
+            }
+            if (configuration.RetainerSession is { } retainerSession &&
+                retainerSession.SessionId == session.SessionId &&
+                retainerSession.State is "Active" or "StopRequested")
+            {
+                retainerSession.State = "Stopped";
+                retainerSession.StopRequested = true;
+                retainerSession.Detail = "Stopped after Ocean Fishing recovery acknowledgment; no new retainer pass will start.";
+            }
         }
         SaveOrRecover("acknowledge Ocean Fishing recovery");
-        return !NeedsRecovery;
+        var succeeded = !NeedsRecovery;
+        if (succeeded)
+        {
+            CanAcknowledgeRecovery = false;
+            RecoveryAcknowledgementStatus = "Fishing recovery acknowledged; automation stopped and this window will not be retried.";
+            PublishDiagnostic("RecoveryAcknowledged", operation.Detail, operation.WindowStartUtc,
+                operation.WindowStartUtc.Add(OceanFishingSchedulePolicy.LaunchCutoffOffset), information: true);
+        }
+        return succeeded;
     }
 
     public void Tick(bool allowNewWindow = true)
@@ -146,6 +262,19 @@ public sealed class OceanFishingHandoffController : IDisposable
             return;
         try
         {
+            if (NeedsRecovery)
+            {
+                RefreshRecoveryAcknowledgementReadiness(force: acknowledgeRecoveryRequested);
+                if (acknowledgeRecoveryRequested)
+                {
+                    acknowledgeRecoveryRequested = false;
+                    if (CanAcknowledgeRecovery)
+                        AcknowledgeRecoveryAndStop();
+                    else
+                        log.Information("Ocean Fishing recovery acknowledgment remains blocked: {Blocker}", RecoveryAcknowledgementStatus);
+                }
+                return;
+            }
             if (Current is { } operation && OwnsActivity)
             {
                 TickOperation(operation);
@@ -185,6 +314,110 @@ public sealed class OceanFishingHandoffController : IDisposable
                 RequireRecovery(detail, error);
         }
     }
+
+    private void RefreshRecoveryAcknowledgementReadiness(bool force)
+    {
+        if (!force && clock.UtcNow < nextRecoverySafetyCheckUtc)
+            return;
+        CanAcknowledgeRecovery = false;
+        nextRecoverySafetyCheckUtc = clock.UtcNow.Add(PollInterval);
+        try
+        {
+            if (Current is not { State: "RecoveryRequired" } operation)
+            {
+                RecoveryAcknowledgementStatus = "No unresolved fishing recovery.";
+                return;
+            }
+            if (!TryCurrentCharacter(out _, out _, out _))
+            {
+                RecoveryAcknowledgementStatus = "Log in and wait for the farming-character identity to load.";
+                return;
+            }
+            if (!MatchesFarmingCharacter(operation))
+            {
+                RecoveryAcknowledgementStatus = $"Return to the farming character {operation.FarmingCharacterName}@{operation.FarmingCharacterWorld}.";
+                return;
+            }
+            if (IsOceanTerritory(gameState.TerritoryType) || gameState.IsDutyStarted || gameState.IsBoundByDuty)
+            {
+                RecoveryAcknowledgementStatus = "Exit the active duty and wait until no duty is bound before acknowledging.";
+                return;
+            }
+            if (!gameState.IsSafePlayerState)
+            {
+                RecoveryAcknowledgementStatus = "Wait for a safe player state outside combat, duty queue, and area transition.";
+                return;
+            }
+            if (dungeonOperationOwned())
+            {
+                RecoveryAcknowledgementStatus = "Resolve the owned dungeon operation before acknowledging fishing recovery.";
+                return;
+            }
+            if (retainerOperationOwned())
+            {
+                RecoveryAcknowledgementStatus = "Wait for the owned AutoRetainer handoff to settle before acknowledging.";
+                return;
+            }
+            var autoDutyStopped = readAutoDutyStopped();
+            if (autoDutyStopped != true)
+            {
+                RecoveryAcknowledgementStatus = autoDutyStopped is null
+                    ? "AutoDuty stopped state is unavailable."
+                    : "Stop AutoDuty and wait for its state to settle.";
+                return;
+            }
+            if (!autoRetainer.TryGetProviderState(out var retainerBusy, out var retainerActive))
+            {
+                RecoveryAcknowledgementStatus = "AutoRetainer state is unavailable.";
+                return;
+            }
+            if (retainerBusy || retainerActive)
+            {
+                RecoveryAcknowledgementStatus = retainerBusy
+                    ? "Wait for AutoRetainer work to finish."
+                    : "Disable AutoRetainer Multi Mode before acknowledging.";
+                return;
+            }
+            if (!lifestream.TryGetBusy(out var lifestreamBusy))
+            {
+                RecoveryAcknowledgementStatus = "Lifestream busy state is unavailable.";
+                return;
+            }
+            if (lifestreamBusy)
+            {
+                RecoveryAcknowledgementStatus = "Wait for Lifestream character switching to finish.";
+                return;
+            }
+            var status = feesh.ReadStatus();
+            if (!status.Available || !feesh.IsAvailable)
+            {
+                RecoveryAcknowledgementStatus = $"WahTools status is unavailable: {status.Detail}";
+                return;
+            }
+            if (clock.UtcNow - status.ObservedUtc > StatusFreshness)
+            {
+                RecoveryAcknowledgementStatus = "WahTools status is stale; waiting for a fresh read.";
+                return;
+            }
+            if (!status.IsClean)
+            {
+                var (_, detail) = DescribeFeeshBlocker(status);
+                RecoveryAcknowledgementStatus = $"WahTools is not clean: {detail}";
+                return;
+            }
+            CanAcknowledgeRecovery = true;
+            RecoveryAcknowledgementStatus = "Safe to acknowledge. The ambiguous voyage will not be retried.";
+        }
+        catch (Exception error)
+        {
+            RecoveryAcknowledgementStatus = $"Recovery safety check failed: {error.GetBaseException().Message}";
+            log.Warning(error, "Ocean Fishing recovery safety check failed; acknowledgment remains blocked.");
+        }
+    }
+
+    private void PublishRecoveryDiagnostic(OceanFishingOperationRecord operation) =>
+        PublishDiagnostic("FishingRecoveryRequired", operation.Detail, operation.WindowStartUtc,
+            operation.WindowStartUtc.Add(OceanFishingSchedulePolicy.LaunchCutoffOffset));
 
     public void Dispose()
     {
@@ -523,6 +756,7 @@ public sealed class OceanFishingHandoffController : IDisposable
         operation.Detail = "Outbound Lifestream intent persisted; requesting selected fishing character once.";
         if (!SaveOrRecover("Ocean Fishing outbound intent"))
             return;
+        lifestreamRequestIssuedThisRuntime = true;
         if (!lifestream.TryChangeCharacter(operation.FishingCharacterName, operation.FishingCharacterWorld, out var result))
         {
             RequireRecovery($"Lifestream outbound request was refused or ambiguous: {result}");
@@ -555,9 +789,15 @@ public sealed class OceanFishingHandoffController : IDisposable
         var request = feesh.RequestSingleVoyage(out var detail);
         if (request == FeeshRequestResult.Accepted)
         {
+            launchAcceptedThisRuntime = true;
+            operation.LaunchAccepted = true;
             operation.State = "AwaitingBoarding";
             operation.PhaseChangedUtc = clock.UtcNow;
-            operation.Detail = detail;
+            var boardingDeadline = OceanFishingSchedulePolicy.GetBoardingDeadlineUtc(
+                operation.WindowStartUtc, operation.LaunchIntentUtc!.Value);
+            operation.Detail = $"{detail} Awaiting matching Ocean Fishing duty through {boardingDeadline:O}; no relaunch will be attempted.";
+            log.Information("Ocean Fishing operation {OperationId} launch accepted; awaiting matching duty until {BoardingDeadlineUtc}; no relaunch will be attempted.",
+                operation.OperationId, boardingDeadline);
             if (!SaveOrRecover("WahTools launch response"))
                 RequireRecovery("WahTools may have accepted launch but its response was not persisted.");
         }
@@ -572,21 +812,26 @@ public sealed class OceanFishingHandoffController : IDisposable
 
     private void ObserveBoarding(OceanFishingOperationRecord operation, DateTimeOffset now)
     {
-        if (IsOceanTerritory(gameState.TerritoryType))
+        var inOceanTerritory = IsOceanTerritory(gameState.TerritoryType);
+        if (inOceanTerritory)
         {
             operation.OceanTerritoryEntered = true;
             sawOceanTerritory = true;
         }
-        if (gameState.IsDutyStarted || gameState.IsBoundByDuty)
+        if (inOceanTerritory && (gameState.IsDutyStarted || gameState.IsBoundByDuty || operation.DutyStarted))
         {
             operation.DutyStarted = true;
             SetState(operation, "VoyageRunning", "Ocean Fishing duty observed for the claimed voyage.");
             return;
         }
-        if (operation.OceanTerritoryEntered)
+        if (operation.LaunchIntentUtc is not { } launchIntentUtc)
+        {
+            RequireRecovery("Ocean Fishing boarding state has no persisted launch intent; no voyage request will be replayed.");
             return;
-        if (now - operation.PhaseChangedUtc >= BoardingTimeout)
-            RequireRecovery("WahTools launch was accepted but no matching Ocean Fishing boarding was observed; no relaunch will be attempted.");
+        }
+        var deadline = OceanFishingSchedulePolicy.GetBoardingDeadlineUtc(operation.WindowStartUtc, launchIntentUtc);
+        if (now >= deadline)
+            RequireRecovery($"WahTools launch was accepted but no matching Ocean Fishing duty was observed by {deadline:O}; no relaunch will be attempted.");
     }
 
     private void WaitForCleanupThenReturn(OceanFishingOperationRecord operation, DateTimeOffset now)
@@ -640,6 +885,7 @@ public sealed class OceanFishingHandoffController : IDisposable
         if (!gameState.IsSafePlayerState || IsOceanTerritory(gameState.TerritoryType) || readAutoDutyStopped() != true ||
             !lifestream.TryGetBusy(out var busy) || busy || !feesh.ReadStatus().IsClean)
             return;
+        lifestreamRequestIssuedThisRuntime = true;
         if (!lifestream.TryChangeCharacter(operation.FarmingCharacterName, operation.FarmingCharacterWorld, out var result))
         {
             RequireRecovery($"Lifestream return request failed or ambiguous: {result}");
@@ -752,6 +998,11 @@ public sealed class OceanFishingHandoffController : IDisposable
         operation.State = state;
         operation.Detail = detail;
         operation.PhaseChangedUtc = clock.UtcNow;
+        if (state is "Completed" or "Skipped")
+        {
+            launchAcceptedThisRuntime = false;
+            lifestreamRequestIssuedThisRuntime = false;
+        }
         cleanupStableSinceUtc = null;
         returnStableSinceUtc = null;
         if (SaveOrRecover("Ocean Fishing phase transition"))
@@ -769,6 +1020,8 @@ public sealed class OceanFishingHandoffController : IDisposable
         operation.PhaseChangedUtc = clock.UtcNow;
         SetSessionRecovery(operation, detail);
         SaveOrRecover("Ocean Fishing recovery state");
+        if (Current is { RecoveryKind: not "PersistenceFailure" } recoveryOperation)
+            PublishRecoveryDiagnostic(recoveryOperation);
         if (error is null)
             log.Error("Ocean Fishing operation {OperationId} requires recovery: {Detail}", operation.OperationId, detail);
         else
@@ -796,6 +1049,7 @@ public sealed class OceanFishingHandoffController : IDisposable
                 operation.RecoveryKind = "PersistenceFailure";
                 operation.Detail = $"Could not persist {purpose}; provider actions are blocked.";
                 SetSessionRecovery(operation, operation.Detail);
+                PublishRecoveryDiagnostic(operation);
             }
             log.Error(error, "Could not persist {Purpose} for Ocean Fishing.", purpose);
             return false;

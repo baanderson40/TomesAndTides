@@ -144,8 +144,34 @@ public sealed class AutomationSessionController(Configuration configuration, Act
         SaveOrBlock("automation Stop completion");
     }
 
+    public void CompleteManualStop(string detail)
+    {
+        if (Current is not { } session)
+            return;
+        session.State = "Stopped";
+        session.StopRequested = true;
+        session.RecoveryKind = null;
+        session.Detail = detail;
+        if (configuration.RetainerSession is { } retainer && retainer.SessionId == session.SessionId)
+        {
+            retainer.State = "Stopped";
+            retainer.StopRequested = true;
+            retainer.RecoveryKind = null;
+            retainer.Detail = detail;
+        }
+    }
+
     public void RecoverAfterReload()
     {
+        if (Current is { State: "StopRequested", RecoveryKind: "ManualStop" } stopped)
+        {
+            stopped.State = "Stopped";
+            stopped.StopRequested = true;
+            stopped.RecoveryKind = null;
+            stopped.Detail = "Manual Stop was persisted before reload. Provider cancellation outcome is unknown; verify providers before starting again.";
+            SaveOrBlock("recover persisted manual Stop");
+            return;
+        }
         if (Current is not { State: "Active" or "StopRequested" } session)
             return;
         session.State = "RecoveryRequired";

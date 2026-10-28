@@ -8,6 +8,7 @@ public sealed class DungeonRunController : IDisposable
     private static readonly TimeSpan StartTimeout = TimeSpan.FromMinutes(3);
     private static readonly TimeSpan DutyTimeout = TimeSpan.FromMinutes(45);
     private static readonly TimeSpan RewardTimeout = TimeSpan.FromSeconds(45);
+    private static readonly TimeSpan LaunchPollInterval = TimeSpan.FromSeconds(5);
 
     private readonly Configuration configuration;
     private readonly Action save;
@@ -28,6 +29,7 @@ public sealed class DungeonRunController : IDisposable
     private int? lastLoggedRewardDelta;
     private int? lastPersistedRewardDelta;
     private bool deferPlanDispatchOneUpdate;
+    private DateTimeOffset nextLaunchValidationUtc;
 
     public DungeonRunController(Configuration configuration, Action save, IAutoDutyClient autoDuty,
         IRetainerProvider autoRetainer, IWorkflowGameState gameState, IWorkflowLog log,
@@ -51,6 +53,8 @@ public sealed class DungeonRunController : IDisposable
         // A saved launch intent is never replayed. Reload makes its outcome uncertain.
         if (configuration.DungeonRun is { } savedRecord && string.IsNullOrWhiteSpace(savedRecord.OperationId))
             savedRecord.OperationId = Guid.NewGuid().ToString("N");
+        if (configuration.DungeonRun is { State: "ManualStopPending" } pendingStop)
+            CancelByUser("Manual Stop was persisted before reload; AutoDuty was not stopped and reward was not credited.");
         if (configuration.DungeonRun is { } record && SingleRunPolicy.StateAfterReload(record.State) == "RecoveryRequired" &&
             record.State != "RecoveryRequired")
         {
@@ -64,7 +68,7 @@ public sealed class DungeonRunController : IDisposable
     }
 
     public DungeonRunRecord? Current => configuration.DungeonRun;
-    public bool HasUnacknowledgedRun => Current is { } run && run.State is not ("Completed" or "Failed");
+    public bool HasUnacknowledgedRun => Current is { } run && run.State is not ("Completed" or "Failed" or "CancelledByUser");
     // Cached by Tick so ImGui rendering never performs game/IPC reads.
     public bool CanAcknowledge => canAcknowledgeSnapshot;
 
@@ -122,7 +126,7 @@ public sealed class DungeonRunController : IDisposable
                         deferPlanDispatchOneUpdate = false;
                         break;
                     }
-                    if (SingleRunPolicy.MayDispatch(run.State))
+                    if (SingleRunPolicy.MayDispatch(run.State) && clock.UtcNow >= nextLaunchValidationUtc)
                         DispatchOnce(run);
                     break;
                 case "LaunchIntentRecorded":
@@ -188,6 +192,11 @@ public sealed class DungeonRunController : IDisposable
         if (Current is not { State: "PendingValidation", FarmingPlanId: { } currentPlanId } run ||
             !string.Equals(currentPlanId, planId, StringComparison.Ordinal))
             return false;
+        var linkedPlan = configuration.FarmingPlan is { } plan && plan.PlanId == planId &&
+                         plan.CurrentOperationId == run.OperationId ? plan : null;
+        var previousOperationId = linkedPlan?.CurrentOperationId;
+        if (linkedPlan is not null)
+            linkedPlan.CurrentOperationId = null;
         configuration.DungeonRun = null;
         try
         {
@@ -198,9 +207,34 @@ public sealed class DungeonRunController : IDisposable
         catch (Exception error)
         {
             configuration.DungeonRun = run;
+            if (linkedPlan is not null)
+                linkedPlan.CurrentOperationId = previousOperationId;
             log.Error(error, "Run {OperationId} pending cancellation could not be persisted; record retained.", OperationId(run));
             return false;
         }
+    }
+
+    public void CancelByUser(string detail)
+    {
+        if (configuration.DungeonRun is not { State: not ("Failed" or "CancelledByUser") } run)
+            return;
+        if (run.State != "Completed" || run.RewardOutcome != "Verified")
+        {
+            run.State = "CancelledByUser";
+            run.RewardOutcome = "Unverified";
+            run.Detail = detail;
+        }
+        configuration.CancelledDungeonRuns ??= [];
+        configuration.CancelledDungeonRuns.Add(run);
+        configuration.DungeonRun = null;
+        startEventSeen = false;
+        dutyEnteredUtc = null;
+        waitingForExitUtc = null;
+        exitedUtc = null;
+        dispatchedThisRuntime = false;
+        canAcknowledgeSnapshot = false;
+        log.Information("Run {OperationId} closed by manual automation Stop; verified reward state preserved and AutoDuty not stopped.",
+            OperationId(run));
     }
 
     public void Dispose()
@@ -229,37 +263,48 @@ public sealed class DungeonRunController : IDisposable
         // reads are performed from the ImGui draw path.
         if (run.CharacterContentId == 0)
         {
-            run.CharacterContentId = gameState.ContentId;
+            run.CharacterContentId = run.FarmingPlanId is { } characterPlanId &&
+                                     configuration.FarmingPlan is { } characterPlan && characterPlan.PlanId == characterPlanId
+                ? characterPlan.CharacterContentId
+                : gameState.ContentId;
             if (!Persist(run, "character snapshot", launchMayHaveHappened: false))
                 return;
         }
         if (!IsSafeIdle(out var idleReason))
         {
-            Fail(run, $"Final launch check failed; no AutoDuty call was made. {idleReason}");
+            WaitForLaunch(run, idleReason);
             return;
         }
         if (gameState.ContentId == 0 || gameState.ContentId != run.CharacterContentId || !gameState.IsLoggedIn || !gameState.HasLocalPlayer)
         {
-            Fail(run, "Character changed or is unavailable; no AutoDuty call was made.");
+            WaitForLaunch(run, "Return to the character that confirmed this run.");
             return;
         }
-        if (!Enum.TryParse<DebugTests.DutyModeSelection>(run.Mode, out var mode) ||
-            eligibility(run.TerritoryId, mode, run.GearsetInspectionId).Status != "Eligible")
+        if (!Enum.TryParse<DebugTests.DutyModeSelection>(run.Mode, out var mode))
         {
-            Fail(run, "Fresh eligibility did not return Eligible; no AutoDuty call was made.");
+            WaitForLaunch(run, "Selected duty mode is unavailable; choose a supported mode and retry.");
             return;
         }
-        if (!TryReadConfig("Meta.AutoDutyModeEnum", out var executionMode) || executionMode != "Looping" ||
-            !TryReadConfig("Meta.LoopTimes", out var loopCount) || loopCount != "1" ||
-            !TryReadConfig("Meta.DutyModeEnum", out var configuredMode) ||
-            !string.Equals(configuredMode, run.Mode, StringComparison.OrdinalIgnoreCase))
+        DebugReport eligibilityReport;
+        try { eligibilityReport = eligibility(run.TerritoryId, mode, run.GearsetInspectionId); }
+        catch (Exception error)
         {
-            Fail(run, "AutoDuty must already be Looping, set to one configured loop, and match the selected mode. TT does not change its settings.");
+            WaitForLaunch(run, $"Dungeon eligibility is unavailable; retrying. {error.GetBaseException().Message}");
             return;
         }
-        if (!TryReadPath(run.TerritoryId, out var hasPath) || !hasPath)
+        if (eligibilityReport.Status != "Eligible")
         {
-            Fail(run, "AutoDuty path is unavailable or unknown; no AutoDuty call was made.");
+            WaitForLaunch(run, $"Waiting for fresh dungeon eligibility ({eligibilityReport.Status}). {eligibilityReport.Text}");
+            return;
+        }
+        if (!TryReadPath(run.TerritoryId, out var hasPath))
+        {
+            WaitForLaunch(run, "AutoDuty path state is unavailable; retrying.");
+            return;
+        }
+        if (!hasPath)
+        {
+            WaitForLaunch(run, "AutoDuty has no path for this dungeon; waiting for path availability.");
             return;
         }
 
@@ -270,19 +315,53 @@ public sealed class DungeonRunController : IDisposable
         }
         catch (Exception error)
         {
-            Fail(run, $"Could not capture fresh weekly tome state; no AutoDuty call was made. {error.GetBaseException().Message}");
+            WaitForLaunch(run, $"Weekly tome state is unavailable; retrying. {error.GetBaseException().Message}");
             return;
         }
-        if (tomeState.CharacterContentId != gameState.ContentId || tomeState.WeeklyAcquired >= tomeState.WeeklyLimit)
+        if (tomeState.CharacterContentId != gameState.ContentId)
         {
-            Fail(run, "Character changed or weekly cap is reached; no AutoDuty call was made.");
+            WaitForLaunch(run, "Live tome state belongs to another character; retrying.");
+            return;
+        }
+        if (tomeState.WeeklyAcquired >= tomeState.WeeklyLimit)
+        {
+            if (run.FarmingPlanId is { } capPlanId && configuration.FarmingPlan?.PlanId == capPlanId)
+            {
+                CancelPendingPlanRun(capPlanId);
+                return;
+            }
+            WaitForLaunch(run, "Weekly tome cap is reached; no dungeon will be dispatched.");
             return;
         }
         var expectedPayout = Math.Min(run.ExpectedReward, tomeState.WeeklyLimit - tomeState.WeeklyAcquired);
         if (tomeState.HeldBalance > 2000 || 2000UL - tomeState.HeldBalance < (ulong)expectedPayout)
         {
-            Fail(run, $"Held tome storage lacks room for expected cap-clamped payout {expectedPayout}; no AutoDuty call was made.");
+            WaitForLaunch(run, $"Free tome storage for the expected payout of {expectedPayout}; no dungeon dispatched.");
             return;
+        }
+
+        if (!TryReadConfig("Meta.DutyModeEnum", out var configuredMode))
+        {
+            WaitForLaunch(run, "AutoDuty duty-mode configuration is unavailable; retrying.");
+            return;
+        }
+        if (!string.Equals(configuredMode, run.Mode, StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                autoDuty.SetConfig("Meta.DutyModeEnum", run.Mode);
+            }
+            catch (Exception error)
+            {
+                WaitForLaunch(run, $"Could not set AutoDuty duty mode to {run.Mode}; retrying. {error.GetBaseException().Message}");
+                return;
+            }
+            if (!TryReadConfig("Meta.DutyModeEnum", out configuredMode) ||
+                !string.Equals(configuredMode, run.Mode, StringComparison.OrdinalIgnoreCase))
+            {
+                WaitForLaunch(run, $"Setting AutoDuty duty mode to {run.Mode}; waiting for confirmation.");
+                return;
+            }
         }
 
         run.CharacterContentId = gameState.ContentId;
@@ -305,10 +384,9 @@ public sealed class DungeonRunController : IDisposable
 
         try
         {
-            // AutoDuty.Run(uint territory, int loops, bool bareMode) always sets execution mode
-            // to Looping. Passing loops=0 avoids overwriting the already-verified configured count.
-            // TT never calls SetConfig/PushConfigOverrides/PopConfigOverrides.
-            autoDuty.Run(run.TerritoryId, run.BareMode ?? true);
+            // AutoDuty.Run sets execution mode to Looping. Explicit loops=1 guarantees this
+            // persisted TT operation is one run regardless of the user's previous loop count.
+            autoDuty.Run(run.TerritoryId, 1, run.BareMode ?? true);
             dispatchedThisRuntime = true;
             run.State = "AwaitingDuty";
             run.Detail = $"AutoDuty.Run requested once for territory {run.TerritoryId}; bareMode={run.BareMode}. Waiting for matching duty entry.";
@@ -583,6 +661,16 @@ public sealed class DungeonRunController : IDisposable
         run.Detail = detail;
         log.Warning("Run {OperationId} blocked before launch: {Detail}", OperationId(run), detail);
         Persist(run, "failed validation", launchMayHaveHappened: false);
+    }
+
+    private void WaitForLaunch(DungeonRunRecord run, string detail)
+    {
+        nextLaunchValidationUtc = clock.UtcNow.Add(LaunchPollInterval);
+        if (run.State != "PendingValidation" || string.Equals(run.Detail, detail, StringComparison.Ordinal))
+            return;
+        run.Detail = detail;
+        if (Persist(run, "pre-launch waiting status", launchMayHaveHappened: false))
+            log.Information("Run {OperationId} waiting before launch: {Reason}", OperationId(run), detail);
     }
 
     private void RequireRecovery(DungeonRunRecord run, string detail, Exception? error = null)

@@ -32,6 +32,8 @@ public sealed class AutoRetainerClient : IRetainerProvider, IDisposable
     private readonly ICallGateSubscriber<bool> multiModeStatus;
     private readonly ICallGateSubscriber<int?, object> enableSingleMultiMode;
     private readonly ICallGateSubscriber<object> singleMultiModeFinished;
+    private readonly ICallGateSubscriber<bool, object> setMultiModeEnabled;
+    private readonly ICallGateSubscriber<object> abortAllTasks;
     private readonly IPluginLog log;
     private readonly IUtcClock clock;
     private string? lastReadinessError;
@@ -72,6 +74,8 @@ public sealed class AutoRetainerClient : IRetainerProvider, IDisposable
         multiModeStatus = pluginInterface.GetIpcSubscriber<bool>("AutoRetainer.PluginState.GetMultiModeStatus");
         enableSingleMultiMode = pluginInterface.GetIpcSubscriber<int?, object>("AutoRetainer.PluginState.EnableSingleMultiMode");
         singleMultiModeFinished = pluginInterface.GetIpcSubscriber<object>("AutoRetainer.PluginState.OnSingleMultiModeFinished");
+        setMultiModeEnabled = pluginInterface.GetIpcSubscriber<bool, object>("AutoRetainer.SetMultiModeEnabled");
+        abortAllTasks = pluginInterface.GetIpcSubscriber<object>("AutoRetainer.PluginState.AbortAllTasks");
         singleMultiModeFinished.Subscribe(OnSinglePassFinished);
     }
 
@@ -192,6 +196,25 @@ public sealed class AutoRetainerClient : IRetainerProvider, IDisposable
 
     /// <summary>Issues one Retainers-only pass. A successful return is not proof of provider acceptance.</summary>
     public void RequestSingleRetainerPass() => enableSingleMultiMode.InvokeAction((int?)0);
+
+    public bool TryCancelOwnedPass(out string detail)
+    {
+        var failures = new List<string>();
+        try
+        {
+            setMultiModeEnabled.InvokeAction(false);
+        }
+        catch (Exception error)
+        {
+            failures.Add($"disable Multi Mode: {error.GetBaseException().Message}");
+        }
+        try { abortAllTasks.InvokeAction(); }
+        catch (Exception error) { failures.Add($"abort task queue: {error.GetBaseException().Message}"); }
+        detail = failures.Count == 0
+            ? "AutoRetainer Multi Mode disabled and task queue abort requested."
+            : $"AutoRetainer cancellation IPC failed ({string.Join("; ", failures)}).";
+        return failures.Count == 0;
+    }
 
     public void Dispose() => singleMultiModeFinished.Unsubscribe(OnSinglePassFinished);
 

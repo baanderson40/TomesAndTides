@@ -33,12 +33,15 @@ public sealed class RetainerHandoffController(
     private bool? providerBusy;
     private bool? providerActive;
     private bool? lifestreamBusy;
+    private bool passRequestIssuedThisRuntime;
+    private bool returnRequestIssuedThisRuntime;
+    private string? providerStartWaitReason;
     public bool CanResumeAutomationSession { get; private set; }
     private IUtcClock Clock { get; } = clock ?? SystemUtcClock.Instance;
 
     public RetainerAutomationSessionRecord? Session => configuration.RetainerSession;
     public RetainerHandoffRecord? Handoff => configuration.RetainerHandoff;
-    public bool OwnsActivity => Handoff is { State: not ("Completed" or "RecoveryAcknowledged") };
+    public bool OwnsActivity => Handoff is { State: not ("Completed" or "RecoveryAcknowledged" or "CancelledByUser") };
     public bool NeedsRecovery => Session is { State: "RecoveryRequired" } || Handoff is { State: "RecoveryRequired" };
 
     public event Action? StateChanged;
@@ -63,6 +66,12 @@ public sealed class RetainerHandoffController(
     {
         var session = Session;
         var handoff = Handoff;
+        if (session?.RecoveryKind == "ManualStop" || handoff?.RecoveryKind == "ManualStop" || handoff?.State == "ManualStopPending")
+        {
+            CompleteManualStop("Manual Stop was persisted before reload; provider cancellation outcome is unknown. Verify provider state before starting again.");
+            SaveOrBlock("recover persisted manual Stop");
+            return;
+        }
         if (session is not null && handoff is { } completed && farmingPlan.Current is { } completedPlan &&
             completedPlan.PlanId == session.FarmingPlanId &&
             RetainerHandoffPolicy.MayReconcileCompletedCheckpoint(completed.State,
@@ -98,30 +107,54 @@ public sealed class RetainerHandoffController(
         log.Warning("Retainer session {SessionId} requires explicit reload recovery; no provider action will be replayed.", session?.SessionId ?? "unknown");
     }
 
-    public void RequestStop()
+    public IReadOnlyList<string> CancelOwnedProviderWorkForManualStop()
     {
-        var parent = configuration.AutomationSession;
-        var session = Session;
-        if (parent is not { State: "Active" } || session is null)
-            return;
-        farmingPlan.RequestStop(preserveOwnedRetainerCheckpoint: OwnsActivity);
-        parent.State = "StopRequested";
-        parent.StopRequested = true;
-        parent.Detail = "Manual Stop requested; no new work will be admitted while owned cleanup settles.";
-        if (OwnsActivity)
+        var warnings = new List<string>();
+        var passMayBeOwned = passRequestIssuedThisRuntime ||
+            Handoff is { LaunchIntentUtc: not null, CompletionEventObserved: false,
+                State: not ("Completed" or "RecoveryAcknowledged" or "CancelledByUser") };
+        if (passMayBeOwned)
         {
-            session.StopRequested = true;
-            session.State = "StopRequested";
-            session.Detail = "Stop requested; the current owned activity will settle safely, with no new dungeon or retainer work.";
+            if (!autoRetainer.TryCancelOwnedPass(out var detail))
+                warnings.Add($"AutoRetainer may still be running: {detail}");
+            else if (!autoRetainer.TryGetProviderState(out var busy, out var active) || busy || active)
+                warnings.Add("AutoRetainer cancellation was requested, but idle state is not confirmed; provider work may continue.");
         }
-        else
+        if (returnRequestIssuedThisRuntime)
+        {
+            if (!lifestream.TryAbortOwnedRequest(out var detail))
+                warnings.Add($"Lifestream travel may still be running: {detail}");
+            else if (!lifestream.TryGetBusy(out var busy) || busy)
+                warnings.Add("Lifestream Abort was requested, but idle state is not confirmed.");
+        }
+        else if (Handoff is { ReturnIntentUtc: not null, State: not ("Completed" or "RecoveryAcknowledged" or "CancelledByUser") })
+            warnings.Add("Lifestream travel may still be running after reload; TT cannot confirm ownership or cancel it from this runtime.");
+        return warnings;
+    }
+
+    public void CompleteManualStop(string detail)
+    {
+        if (Handoff is { } handoff && handoff.State is not ("Completed" or "RecoveryAcknowledged" or "CancelledByUser"))
+        {
+            handoff.State = "CancelledByUser";
+            handoff.RecoveryKind = null;
+            handoff.Detail = detail;
+            handoff.PhaseChangedUtc = Clock.UtcNow;
+            configuration.CancelledRetainerHandoffs ??= [];
+            configuration.CancelledRetainerHandoffs.Add(handoff);
+            configuration.RetainerHandoff = null;
+        }
+        if (Session is { } session)
         {
             session.State = "Stopped";
             session.StopRequested = true;
-            session.Detail = "Automation session stopped at a safe boundary; no further dungeon or retainer work will start.";
+            session.RecoveryKind = null;
+            session.Detail = detail;
         }
-        SaveOrBlock("stop retainer session");
-        log.Information("Retainer session {SessionId} Stop requested; handoffOwned={HandoffOwned}.", session.SessionId, OwnsActivity);
+        idleSinceUtc = null;
+        safeSinceUtc = null;
+        passRequestIssuedThisRuntime = false;
+        returnRequestIssuedThisRuntime = false;
         StateChanged?.Invoke();
     }
 
@@ -209,6 +242,42 @@ public sealed class RetainerHandoffController(
         // above and may still settle safely while new work is paused.
         if (!allowNewWork)
             return;
+        if (dungeonRun.Current is null && session.State == "Active")
+        {
+            string? unsafeReason = null;
+            bool? autoDutyStopped;
+            try { autoDutyStopped = readAutoDutyStopped(); }
+            catch { autoDutyStopped = null; }
+            if (!TryPollProviders())
+                unsafeReason = "AutoRetainer or Lifestream state is unavailable";
+            else if (providerBusy != false || providerActive != false || lifestreamBusy != false)
+                unsafeReason = "AutoRetainer or Lifestream is active";
+            else if (autoDutyStopped != true)
+                unsafeReason = autoDutyStopped is false ? "AutoDuty is active" : "AutoDuty state is unavailable";
+            if (unsafeReason is not null)
+            {
+                var waitDetail = $"Waiting before provider work: {unsafeReason}. TT will continue automatically when providers are idle.";
+                if (!string.Equals(providerStartWaitReason, unsafeReason, StringComparison.Ordinal))
+                {
+                    log.Information("Automation session {SessionId} waiting before provider work: {Reason}.",
+                        session.SessionId, unsafeReason);
+                    session.Detail = waitDetail;
+                    parent.Detail = waitDetail;
+                    StateChanged?.Invoke();
+                }
+                providerStartWaitReason = unsafeReason;
+                return;
+            }
+            if (providerStartWaitReason is { } previousReason)
+            {
+                log.Information("Automation session {SessionId} provider wait cleared: {Reason}.",
+                    session.SessionId, previousReason);
+                session.Detail = "Retainer servicing is authorized by the active parent automation session.";
+                parent.Detail = "Explicitly confirmed parent automation session is active.";
+                providerStartWaitReason = null;
+                StateChanged?.Invoke();
+            }
+        }
         if (!checkpointPending && !farmingPlan.AllowsRetainerHandoffNow && !(allowNewWork && plan is null))
             return;
         var serviceEnabled = parent.ServiceRetainers;
@@ -319,6 +388,7 @@ public sealed class RetainerHandoffController(
         log.Information("Retainer handoff {HandoffId} launch intent persisted; requesting one Retainers-only AutoRetainer pass.", handoff.HandoffId);
         try
         {
+            passRequestIssuedThisRuntime = true;
             autoRetainer.RequestSingleRetainerPass();
             handoff.State = "AwaitingStart";
             handoff.Detail = "AutoRetainer request returned; waiting for owned pass lifecycle evidence.";
@@ -343,6 +413,7 @@ public sealed class RetainerHandoffController(
         if (eventObserved)
         {
             handoff.CompletionEventObserved = true;
+            passRequestIssuedThisRuntime = false;
             log.Information("Retainer handoff {HandoffId} observed the AutoRetainer single-pass completion event.", handoff.HandoffId);
             if (!PersistHandoff(handoff, "completion event"))
                 return;
@@ -459,6 +530,7 @@ public sealed class RetainerHandoffController(
             readAutoDutyStopped() != true || !IsSafePlayerState())
             return;
         log.Information("Retainer handoff {HandoffId} return intent persisted; requesting farming-character return once.", handoff.HandoffId);
+        returnRequestIssuedThisRuntime = true;
         if (!lifestream.TryChangeCharacter(session.FarmingCharacterName, session.FarmingCharacterWorld, out var result))
         {
             RequireRecovery($"Lifestream rejected or ambiguously failed the one-time return request: {result}");
@@ -488,6 +560,8 @@ public sealed class RetainerHandoffController(
             session.Detail = "Retainer pass completed and farming character verified; session remains active.";
         if (SaveOrBlock("complete retainer handoff"))
         {
+            passRequestIssuedThisRuntime = false;
+            returnRequestIssuedThisRuntime = false;
             log.Information("Retainer handoff {HandoffId} completed and credited once; session {SessionId} is {State}.",
                 handoff.HandoffId, session.SessionId, session.State);
             if (farmingPlan.Current is { RetainerCheckpointOperationId: { } operationId } plan)

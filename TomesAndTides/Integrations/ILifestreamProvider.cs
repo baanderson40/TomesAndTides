@@ -4,4 +4,5 @@ public interface ILifestreamProvider
 {
     bool TryGetBusy(out bool busy);
     bool TryChangeCharacter(string name, string world, out string result);
+    bool TryAbortOwnedRequest(out string result);
 }

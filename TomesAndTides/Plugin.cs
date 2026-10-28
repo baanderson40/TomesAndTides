@@ -40,6 +40,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly DalamudWorkflowGameState gameState;
     private readonly RetainerHandoffController retainerHandoff;
     private readonly OceanFishingHandoffController oceanFishing;
+    private readonly ManualStopController manualStop;
     private RetainerReadinessSnapshot? retainerReadiness;
     private IReadOnlyList<RetainerCharacterIdentity> retainerRoster = [];
     private bool retainerRosterKnown;
@@ -94,6 +95,8 @@ public sealed class Plugin : IDalamudPlugin
             autoRetainer, lifestream, feesh, () => dungeonRun.Current is not null,
             debugTests.ReadAutoDutyStopped, workflowLog,
             retainerOperationOwned: () => retainerHandoff.OwnsActivity);
+        manualStop = new ManualStopController(configuration, SaveConfiguration, automationSession, farmingPlan,
+            dungeonRun, retainerHandoff, oceanFishing, debugTests.ReadAutoDutyStopped, workflowLog);
         retainerHandoff.Subscribe();
         automationSession.RecoverAfterReload();
         farmingPlan.RecoverAfterReload();
@@ -101,6 +104,7 @@ public sealed class Plugin : IDalamudPlugin
         oceanFishing.RecoverAfterReload();
         mainWindow = new MainWindow(session, configuration, dungeonRun, farmingPlan, SaveConfiguration, OpenDiagnostics, Log,
             () => retainerReadiness, retainerHandoff, automationSession, oceanFishing,
+            manualStop,
             () => (retainerRosterKnown, retainerRoster));
         debugWindow = new DebugWindow(session, configuration, dungeonRun, farmingPlan, retainerHandoff,
             automationSession, oceanFishing,
@@ -176,6 +180,8 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnUpdate(IFramework framework)
     {
+        if (manualStop.Tick())
+            return;
         retainerHandoff.RefreshResumeReadiness();
         oceanFishing.RefreshResumeReadiness();
         var oceanOwns = oceanFishing.OwnsActivity;

@@ -1,6 +1,6 @@
 namespace TomesAndTides.Debugging;
 
-/// <summary>Persisted framework-thread coordinator for one bounded weekly tome plan.</summary>
+/// <summary>Persisted framework-thread scheduler with one current-period dungeon checklist.</summary>
 public sealed class FarmingPlanController(
     Configuration configuration,
     Action save,
@@ -19,6 +19,17 @@ public sealed class FarmingPlanController(
     private IUtcClock Clock { get; } = clock ?? SystemUtcClock.Instance;
 
     public FarmingPlanRecord? Current => configuration.FarmingPlan;
+    public FarmingPeriodRecord? CurrentChecklist
+    {
+        get
+        {
+            var plan = Current;
+            if (plan is null)
+                return null;
+            var currentStart = FarmingSchedulePolicy.GetPeriodStartUtc(Clock.UtcNow, plan.WeekStartUtc);
+            return plan.Periods.FirstOrDefault(period => period.StartUtc == currentStart);
+        }
+    }
     public bool IsActive => Current is { State: "Active" or "PendingValidation" };
     public bool AllowsRetainerHandoffNow
     {
@@ -86,6 +97,12 @@ public sealed class FarmingPlanController(
     public void RecoverAfterReload()
     {
         var plan = Current;
+        if (plan is { RecoveryKind: "ManualStop" })
+        {
+            CompleteManualStop("Manual Stop was persisted before reload; no plan work will resume.");
+            SavePlan(plan, "recover persisted manual Stop");
+            return;
+        }
         if (plan is not { State: "Active" or "PendingValidation" })
             return;
         plan.State = "RecoveryRequired";
@@ -217,6 +234,23 @@ public sealed class FarmingPlanController(
         plan.Detail = "Stop requested; no further dungeon launch will be issued.";
         if (SavePlan(plan, "stop request"))
             log.Information("Farming plan {PlanId} Stop requested.", plan.PlanId);
+    }
+
+    public void CompleteManualStop(string detail)
+    {
+        if (Current is not { } plan)
+            return;
+        plan.State = "Stopped";
+        plan.RecoveryKind = null;
+        plan.StopRequested = true;
+        if (dungeonRun.Current is not { State: "AwaitingDuty" or "RunningDuty" or "WaitingForExit" or "WaitingForReward" } activeRun ||
+            activeRun.FarmingPlanId != plan.PlanId)
+            plan.CurrentOperationId = null;
+        plan.RetainerCheckpointOperationId = null;
+        plan.Blocker = null;
+        plan.RetryAfterUtc = null;
+        plan.Detail = $"{detail} Period allocations and credited-run history preserved.";
+        nextRefreshUtc = DateTimeOffset.MinValue;
     }
 
     public bool CompleteRetainerCheckpoint(string operationId, string detail)
@@ -394,6 +428,12 @@ public sealed class FarmingPlanController(
         if (plan is null)
             return;
 
+        if (plan.State == "Stopped")
+        {
+            ObserveStoppedRun(plan);
+            return;
+        }
+
         if (plan.State == "PendingValidation")
         {
             if (plan.StopRequested)
@@ -419,6 +459,20 @@ public sealed class FarmingPlanController(
                 plan.CurrentOperationId = run.OperationId;
                 if (!SavePlan(plan, "link recovered farming run"))
                     return;
+            }
+            // Legacy weekly plans may already contain today's period while their saved pointer
+            // still points at yesterday. The active run's immutable period link is authoritative.
+            if (run.FarmingPeriodStartUtc is { } activePeriod &&
+                activePeriod == FarmingSchedulePolicy.GetPeriodStartUtc(Clock.UtcNow, plan.WeekStartUtc) &&
+                plan.Periods.FirstOrDefault(period => period.StartUtc == activePeriod) is { } activeChecklist &&
+                (plan.CurrentPeriodStartUtc != activePeriod || plan.Periods.Count != 1))
+            {
+                plan.CurrentPeriodStartUtc = activePeriod;
+                plan.Periods = [activeChecklist];
+                if (!SavePlan(plan, "repair current checklist pointer from active run"))
+                    return;
+                log.Information("Farming plan {PlanId} repaired current checklist pointer from active run {OperationId}: period={PeriodStartUtc}, progress={Completed}/{Target}.",
+                    plan.PlanId, run.OperationId, activePeriod, activeChecklist.CompletedRuns, activeChecklist.AllocatedRuns);
             }
             if (run.State == "RecoveryRequired")
             {
@@ -496,14 +550,9 @@ public sealed class FarmingPlanController(
         }
 
         var now = Clock.UtcNow;
-        if (now >= plan.WeeklyResetUtc)
+        if (now >= plan.FinishDeadlineUtc && now < plan.WeeklyResetUtc)
         {
-            Transition(plan, "Expired", "Weekly reset reached; plan will not resume in the new week.");
-            return;
-        }
-        if (now >= plan.FinishDeadlineUtc)
-        {
-            Transition(plan, "DeadlineReached", "Configured finish period reached; remaining tome work was not launched.");
+            SetWaiting(plan, "Dungeon checklist finished for this schedule; retainers and fishing remain active until weekly reset.");
             return;
         }
         if (externalCharacterHandoffOwns)
@@ -516,7 +565,7 @@ public sealed class FarmingPlanController(
 
         if (gameState.ContentId == 0 || gameState.ContentId != plan.CharacterContentId)
         {
-            Transition(plan, "RecoveryRequired", "Farming character changed during the plan; no further run will launch.");
+            SetBlocker(plan, "Waiting for the farming character to return before continuing the checklist.");
             return;
         }
 
@@ -527,49 +576,92 @@ public sealed class FarmingPlanController(
             SetBlocker(plan, $"Live tome state unknown: {error.GetBaseException().Message}");
             return;
         }
-        if (tome.CharacterContentId != plan.CharacterContentId || tome.CurrencyItemId != plan.CurrencyItemId ||
-            tome.WeeklyLimit != plan.WeeklyLimitAtStart)
+        if (tome.CharacterContentId != plan.CharacterContentId)
         {
-            Transition(plan, "RecoveryRequired", "Character, capped currency identity, or weekly cap changed; plan cannot safely continue.");
+            SetBlocker(plan, "Waiting for fresh tome state for the farming character.");
             return;
+        }
+        var currentWeekStart = FarmingSchedulePolicy.GetWeekStartUtc(now);
+        if (currentWeekStart != plan.WeekStartUtc)
+        {
+            plan.WeekStartUtc = currentWeekStart;
+            plan.WeeklyResetUtc = currentWeekStart.AddDays(7);
+            plan.FinishDeadlineUtc = FarmingSchedulePolicy.GetFinishDeadlineUtc(currentWeekStart, plan.RequestedPeriodCount);
+            plan.CurrentPeriodStartUtc = null;
+            plan.Periods = [];
+            plan.WeeklyAcquiredAtStart = tome.WeeklyAcquired;
+            plan.WeeklyLimitAtStart = tome.WeeklyLimit;
+            plan.CurrencyItemId = tome.CurrencyItemId;
+            plan.Detail = "Weekly reset detected; calculating a fresh current-period checklist.";
+            plan.Blocker = null;
+            if (!SavePlan(plan, "begin new weekly checklist"))
+                return;
+            log.Information("Farming plan {PlanId} detected weekly reset {WeekStartUtc}; current-period checklist will be recalculated.",
+                plan.PlanId, currentWeekStart);
+        }
+        if (plan.WeeklyLimitAtStart != tome.WeeklyLimit || plan.CurrencyItemId != tome.CurrencyItemId)
+        {
+            plan.WeeklyLimitAtStart = tome.WeeklyLimit;
+            plan.CurrencyItemId = tome.CurrencyItemId;
+            SavePlan(plan, "refresh weekly tome identity");
         }
         var runsNeeded = FarmingSchedulePolicy.RunsNeeded(tome.WeeklyAcquired, tome.WeeklyLimit, plan.DungeonReward);
         if (runsNeeded == 0)
         {
-            Transition(plan, "Completed", "Weekly tome cap reached; dungeon farming complete.");
+            SetWaiting(plan, "Weekly tome cap reached; dungeon checklist is paused until weekly reset.");
             return;
         }
 
         var currentPeriodStart = FarmingSchedulePolicy.GetPeriodStartUtc(now, plan.WeekStartUtc);
-        var periodIndex = FarmingSchedulePolicy.GetPeriodIndex(currentPeriodStart, plan.WeekStartUtc);
-        var totalPeriods = FarmingSchedulePolicy.GetPeriodIndex(plan.FinishDeadlineUtc, plan.WeekStartUtc);
-        if (plan.CurrentPeriodStartUtc is { } lastPeriod && currentPeriodStart < lastPeriod)
+        if (currentPeriodStart >= plan.FinishDeadlineUtc)
         {
-            Transition(plan, "RecoveryRequired", "UTC clock moved behind the persisted farming period; schedule progression paused.");
+            SetWaiting(plan, "Dungeon checklist finished for this schedule; retainers and fishing remain active until weekly reset.");
             return;
         }
-        if (periodIndex >= totalPeriods)
-        {
-            Transition(plan, "DeadlineReached", "No scheduled periods remain before finish deadline.");
-            return;
-        }
-        if (plan.CurrentPeriodStartUtc != currentPeriodStart)
-        {
-            if (!ReallocateFrom(plan, currentPeriodStart, runsNeeded))
-                return;
-        }
-        else if (!ShrinkAllocationsForExternalProgress(plan, runsNeeded))
-            return;
 
         var currentPeriod = plan.Periods.FirstOrDefault(period => period.StartUtc == currentPeriodStart);
         if (currentPeriod is null)
         {
-            Transition(plan, "RecoveryRequired", "Current period missing from persisted ledger.");
-            return;
+            var target = FarmingSchedulePolicy.CurrentPeriodTarget(runsNeeded, currentPeriodStart, plan.FinishDeadlineUtc);
+            currentPeriod = new FarmingPeriodRecord { StartUtc = currentPeriodStart, AllocatedRuns = target };
+            plan.CurrentPeriodStartUtc = currentPeriodStart;
+            plan.Periods = [currentPeriod];
+            plan.Blocker = null;
+            plan.RetryAfterUtc = null;
+            plan.Detail = $"Current-period checklist created: 0/{target} runs.";
+            if (!SavePlan(plan, "create current-period checklist"))
+                return;
+            log.Information("Farming plan {PlanId} checklist created for {PeriodStartUtc}: target={Target}, weeklyRunsRemaining={RunsRemaining}, finish={FinishUtc}.",
+                plan.PlanId, currentPeriodStart, target, runsNeeded, plan.FinishDeadlineUtc);
+        }
+        else
+        {
+            var pointerIsStale = plan.CurrentPeriodStartUtc != currentPeriodStart;
+            var checklistHasProgress = currentPeriod.CompletedRuns > 0 || (currentPeriod.CreditedOperationIds?.Count ?? 0) > 0;
+            var hasLegacyFutureAllocations = plan.Periods.Count > 1;
+            var recalculateUntouchedTarget = !checklistHasProgress && (pointerIsStale || hasLegacyFutureAllocations);
+            if (recalculateUntouchedTarget)
+                currentPeriod.AllocatedRuns = FarmingSchedulePolicy.CurrentPeriodTarget(runsNeeded, currentPeriodStart, plan.FinishDeadlineUtc);
+
+            var requiresMigration = pointerIsStale || plan.Periods.Count != 1;
+            if (requiresMigration)
+            {
+                plan.CurrentPeriodStartUtc = currentPeriodStart;
+                plan.Periods = [currentPeriod];
+                plan.Detail = checklistHasProgress
+                    ? $"Current-period checklist restored: {currentPeriod.CompletedRuns}/{currentPeriod.AllocatedRuns} runs."
+                    : $"Current-period checklist calculated: 0/{currentPeriod.AllocatedRuns} runs.";
+                plan.Blocker = null;
+                plan.RetryAfterUtc = null;
+                if (!SavePlan(plan, "migrate single current-period checklist"))
+                    return;
+                log.Information("Farming plan {PlanId} migrated current checklist: period={PeriodStartUtc}, progress={Completed}/{Target}, recalculated={Recalculated}.",
+                    plan.PlanId, currentPeriodStart, currentPeriod.CompletedRuns, currentPeriod.AllocatedRuns, recalculateUntouchedTarget);
+            }
         }
         if (currentPeriod.CompletedRuns >= currentPeriod.AllocatedRuns)
         {
-            SetBlocker(plan, $"Current period allocation complete ({currentPeriod.CompletedRuns}/{currentPeriod.AllocatedRuns}); waiting for {currentPeriodStart.AddDays(1):O} UTC.", persist: false);
+            SetWaiting(plan, $"Checklist complete: {currentPeriod.CompletedRuns}/{currentPeriod.AllocatedRuns}. Next period starts {currentPeriodStart.AddDays(1):O} UTC.");
             plan.RetryAfterUtc = null;
             nextRefreshUtc = currentPeriodStart.AddDays(1);
             return;
@@ -608,6 +700,8 @@ public sealed class FarmingPlanController(
         var period = currentPeriodStart;
         var queuedRun = dungeonRun.Queue(new DungeonRunRequest(dungeon, mode,
             plan.GearsetInspectionId, plan.BareMode, plan.PlanId, period));
+        plan.CurrentPeriodStartUtc = period;
+        plan.Periods = [currentPeriod];
         plan.CurrentOperationId = queuedRun.OperationId;
         if (!SavePlan(plan, "record farming run operation"))
         {
@@ -696,65 +790,44 @@ public sealed class FarmingPlanController(
         plan.CurrencyItemId = tome.CurrencyItemId;
         plan.CharacterContentId = tome.CharacterContentId;
         var periodStart = FarmingSchedulePolicy.GetPeriodStartUtc(now, weekStart);
+        var target = FarmingSchedulePolicy.CurrentPeriodTarget(needed, periodStart, finish);
         plan.CurrentPeriodStartUtc = periodStart;
-        plan.Periods = FarmingSchedulePolicy.CreatePeriods(periodStart, finish, needed)
-            .Select(period => new FarmingPeriodRecord { StartUtc = period.StartUtc, AllocatedRuns = period.AllocatedRuns }).ToList();
-        plan.State = needed == 0 ? "Completed" : "Active";
-        plan.Detail = needed == 0 ? "Weekly tome cap already reached." : "Plan validated; automatic period-based dungeon farming active.";
+        plan.Periods = [new FarmingPeriodRecord { StartUtc = periodStart, AllocatedRuns = target }];
+        plan.State = "Active";
+        plan.Detail = target == 0
+            ? "Weekly tome cap already reached; retainer and fishing scheduling remains active."
+            : $"Current-period checklist created: 0/{target} runs.";
         plan.Blocker = null;
         if (!SavePlan(plan, "initialize farming plan"))
             Transition(plan, "RecoveryRequired", "Could not persist initialized farming plan.");
         else
-            log.Information("Farming plan {PlanId} initialized; weekStart={WeekStartUtc}, deadline={DeadlineUtc}, periods={PeriodCount}, runsNeeded={RunsNeeded}, reward={Reward}, weekly={Weekly}/{Cap}, currencyItem={CurrencyItem}.",
-                plan.PlanId, plan.WeekStartUtc, plan.FinishDeadlineUtc, plan.Periods.Count, needed,
+            log.Information("Farming plan {PlanId} initialized; weekStart={WeekStartUtc}, deadline={DeadlineUtc}, currentPeriodTarget={Target}, weeklyRunsRemaining={RunsNeeded}, reward={Reward}, weekly={Weekly}/{Cap}, currencyItem={CurrencyItem}.",
+                plan.PlanId, plan.WeekStartUtc, plan.FinishDeadlineUtc, target, needed,
                 plan.DungeonReward, tome.WeeklyAcquired, tome.WeeklyLimit, plan.CurrencyItemId);
     }
 
-    private bool ReallocateFrom(FarmingPlanRecord plan, DateTimeOffset currentPeriodStart, int runsNeeded)
+    private void SetWaiting(FarmingPlanRecord plan, string detail)
     {
-        var past = plan.Periods.Where(period => period.StartUtc < currentPeriodStart).ToList();
-        var future = FarmingSchedulePolicy.CreatePeriods(currentPeriodStart, plan.FinishDeadlineUtc, runsNeeded);
-        plan.Periods = past.Concat(future.Select(period => new FarmingPeriodRecord
-        {
-            StartUtc = period.StartUtc,
-            AllocatedRuns = period.AllocatedRuns,
-        })).ToList();
-        plan.CurrentPeriodStartUtc = currentPeriodStart;
-        log.Information("Farming plan {PlanId} advanced to period {PeriodStartUtc}; redistributed {RunsNeeded} required runs over {PeriodCount} remaining periods: {Allocations}.",
-            plan.PlanId, currentPeriodStart, runsNeeded, future.Count,
-            string.Join(",", future.Select(period => period.AllocatedRuns)));
-        return SavePlan(plan, "period advancement and redistribution");
+        plan.Blocker = null;
+        plan.RetryAfterUtc = null;
+        if (plan.Detail == detail)
+            return;
+        plan.Detail = detail;
+        SavePlan(plan, "update scheduler status");
+        log.Information("Farming plan {PlanId}: {Detail}", plan.PlanId, detail);
     }
 
-    private bool ShrinkAllocationsForExternalProgress(FarmingPlanRecord plan, int runsNeeded)
+    private void ObserveStoppedRun(FarmingPlanRecord plan)
     {
-        var currentStart = plan.CurrentPeriodStartUtc!.Value;
-        var currentIndex = plan.Periods.FindIndex(period => period.StartUtc == currentStart);
-        if (currentIndex < 0)
-            return false;
-        var active = plan.Periods[currentIndex];
-        var currentRemaining = Math.Max(0, active.AllocatedRuns - active.CompletedRuns);
-        var scheduledRemaining = plan.Periods.Skip(currentIndex)
-            .Sum(period => Math.Max(0, period.AllocatedRuns - period.CompletedRuns));
-        if (runsNeeded >= scheduledRemaining)
-            return true;
-
-        var currentBudget = Math.Min(currentRemaining, runsNeeded);
-        var futureRuns = runsNeeded - currentBudget;
-        active.AllocatedRuns = active.CompletedRuns + currentBudget;
-        var futurePeriods = plan.Periods.Skip(currentIndex + 1).ToList();
-        if (futurePeriods.Count > 0)
-        {
-            var distribution = FarmingSchedulePolicy.DistributeRuns(futureRuns, futurePeriods.Count);
-            for (var index = 0; index < futurePeriods.Count; index++)
-                futurePeriods[index].AllocatedRuns = futurePeriods[index].CompletedRuns + distribution[index];
-        }
-        if (futureRuns == 0)
-            foreach (var future in futurePeriods)
-                future.AllocatedRuns = future.CompletedRuns;
-        log.Information("Farming plan {PlanId} adjusted allocations after fresh weekly progress; requiredRuns={RunsNeeded}, allocations={Allocations}.",
-            plan.PlanId, runsNeeded, string.Join(",", plan.Periods.Skip(currentIndex).Select(period => period.AllocatedRuns - period.CompletedRuns)));
-        return SavePlan(plan, "external tome progress reallocation");
+        if (dungeonRun.Current is not { State: "Completed", RewardOutcome: "Verified" } run ||
+            run.FarmingPlanId != plan.PlanId || plan.CurrentOperationId != run.OperationId)
+            return;
+        if (!CreditVerifiedRun(plan, run))
+            return;
+        if (!dungeonRun.CanAcknowledge || !dungeonRun.Acknowledge())
+            return;
+        plan.CurrentOperationId = null;
+        SavePlan(plan, "release observed stopped run");
     }
 
     private bool CreditVerifiedRun(FarmingPlanRecord plan, DungeonRunRecord run)

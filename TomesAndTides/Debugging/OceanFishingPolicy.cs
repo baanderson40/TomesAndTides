@@ -23,6 +23,17 @@ public static class OceanFishingSchedulePolicy
     public static readonly TimeSpan RegistrationLength = TimeSpan.FromMinutes(15);
     public static readonly TimeSpan WindowInterval = TimeSpan.FromHours(2);
     public static readonly TimeSpan LaunchCutoffOffset = TimeSpan.FromMinutes(13);
+    public static readonly TimeSpan BoardingTimeoutAfterLaunch = TimeSpan.FromMinutes(30);
+    public static readonly TimeSpan BoardingGraceAfterRegistration = TimeSpan.FromMinutes(5);
+
+    public static DateTimeOffset GetBoardingDeadlineUtc(DateTimeOffset windowStartUtc, DateTimeOffset launchIntentUtc)
+    {
+        var launchDeadline = launchIntentUtc.ToUniversalTime().Add(BoardingTimeoutAfterLaunch);
+        var registrationDeadline = windowStartUtc.ToUniversalTime()
+            .Add(RegistrationLength)
+            .Add(BoardingGraceAfterRegistration);
+        return launchDeadline > registrationDeadline ? launchDeadline : registrationDeadline;
+    }
 
     public static OceanFishingWindow GetWindow(DateTimeOffset nowUtc, int preparationLeadMinutes)
     {

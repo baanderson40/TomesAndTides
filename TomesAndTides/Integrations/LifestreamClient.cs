@@ -39,4 +39,19 @@ public sealed class LifestreamClient(IDalamudPluginInterface pluginInterface) : 
             return false;
         }
     }
+
+    public bool TryAbortOwnedRequest(out string result)
+    {
+        try
+        {
+            pluginInterface.GetIpcSubscriber<object>("Lifestream.Abort").InvokeAction();
+            result = "Lifestream Abort accepted.";
+            return true;
+        }
+        catch (Exception error)
+        {
+            result = $"Lifestream Abort failed: {error.GetBaseException().Message}";
+            return false;
+        }
+    }
 }

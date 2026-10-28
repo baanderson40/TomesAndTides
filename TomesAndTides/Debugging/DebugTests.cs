@@ -384,16 +384,17 @@ public sealed class DebugTests(
             text.AppendLine($"Selected dungeon path: <unavailable: {error.GetBaseException().Message}>");
         }
 
-        text.AppendLine("\nAutoDuty.Run forces AutoDutyModeEnum to Looping. TT requires Looping/one loop already configured and passes loops=0, so it does not request a loop-count write.");
+        text.AppendLine("\nTT automatically selects the configured Trust/Support duty mode and calls AutoDuty.Run with one loop. AutoDuty.Run selects Looping mode; prior loop-count settings do not block TT.");
         text.AppendLine("bareMode temporarily disables normal pre-, between-, and termination-action groups; AutoDuty restores their enabled flags in StopAndResetAll. Locked provider actions may still be evaluated.");
         text.AppendLine("AutoDuty's normal stop globally calls PopConfigOverrides without an owner token. TT never pushes or pops overrides.");
         text.AppendLine("A TT one-run action requires the user to keep other integrations from controlling AutoDuty or pushing overrides until the run is released.");
         text.AppendLine($"TT Enable AutoDuty loop actions: {configuration.EnableAutoDutyLoopActions}; proposed bareMode: {SingleRunPolicy.BareModeFor(configuration.EnableAutoDutyLoopActions)}.");
         text.AppendLine("No AutoDuty settings or provider actions were changed by this diagnostic.");
 
-        var valuesKnown = config.All(entry => values.TryGetValue(entry.Item1, out var value) && !string.IsNullOrWhiteSpace(value));
-        var status = stopped == false || selectedPath == false ? "Blocked" : stopped is null || selectedPath is null || !valuesKnown ? "Unknown" :
-            modeMatches && loopMode && singleLoop ? "Provider settings compatible; explicit ownership confirmation required" : "Blocked";
+        var dutyModeKnown = !string.IsNullOrWhiteSpace(modeValue);
+        var status = stopped == false || selectedPath == false ? "Blocked" :
+            stopped != true || selectedPath is null || !dutyModeKnown ? "Unknown" :
+            "Ready for TT preparation; explicit ownership confirmation required";
         return new(status, text.ToString());
     }
 

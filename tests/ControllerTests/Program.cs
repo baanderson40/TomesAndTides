@@ -12,6 +12,9 @@ var tests = new (string Name, Action Run)[]
     ("ambiguous retainer launch reload requires recovery without replay", TestReloadDoesNotReplayLaunchIntent),
     ("checkpoint persistence failure prevents dungeon continuation", TestCheckpointPersistenceFailure),
     ("synchronous AutoRetainer completion event is retained", TestSynchronousCompletion),
+    ("AutoDuty mode is prepared and one loop requested despite prior settings", TestAutoDutyPreparedForSingleRun),
+    ("failed AutoDuty mode write waits and retries without failed runs", TestAutoDutyModeWriteRetries),
+    ("unknown or busy provider waits before dispatch then resumes", TestPrelaunchProviderWaitResumes),
     ("Stop during near-complete wait prevents new provider work", TestStopDuringVentureWait),
     ("unsafe farming-character return verification times out without retry", TestReturnVerificationTimeout),
     ("near-complete wait services venture when it becomes ready", TestVentureBecomesReady),
@@ -20,8 +23,28 @@ var tests = new (string Name, Action Run)[]
     ("reload resume restores parent session and captured fishing settings", TestReloadResumesParentSession),
     ("failed coordinated resume restores recovery state", TestReloadResumePersistenceFailure),
     ("ambiguous fishing recovery blocks farming resume", TestAmbiguousFishingBlocksResume),
+    ("safe fishing recovery acknowledgment persists and never relaunches", TestFishingRecoveryAcknowledgedSafely),
+    ("fishing recovery acknowledgment revalidates safety on framework tick", TestFishingRecoveryAcknowledgementRevalidates),
+    ("failed fishing recovery acknowledgment save preserves recovery", TestFishingRecoveryAcknowledgementSaveFailure),
+    ("manual Stop cancels owned retainer work without character return", TestManualStopCancelsRetainerImmediately),
+    ("manual Stop cancels TT-owned WahTools without voyage replay", TestManualStopCancelsOwnedWahTools),
+    ("manual Stop clears fishing recovery without requiring safe return", TestManualStopClearsFishingRecovery),
+    ("manual Stop records uncertain provider cancellation and preserves credited runs", TestManualStopRecordsCancellationWarnings),
+    ("manual Stop cancels queued dungeon before AutoDuty dispatch", TestManualStopCancelsPendingDungeon),
+    ("manual Stop keeps launched dungeon observer attached", TestManualStopObservesLaunchedDungeon),
+    ("same-period checklist target survives refresh", TestSamePeriodChecklistPreserved),
+    ("new period creates one fresh checklist from live tome count", TestPeriodRolloverCreatesChecklist),
+    ("active run repairs stale checklist pointer without losing progress", TestActiveRunRepairsChecklistPointer),
+    ("untouched legacy future allocation is recalculated", TestLegacyFutureTargetRecalculated),
+    ("new session waits for active AutoRetainer after immediate Stop", TestManualStopStillGatesRestartOnProviderState),
+    ("persisted manual Stop reload finalizes without replaying provider actions", TestManualStopReloadDoesNotReplay),
     ("uninitialized WahTools trip is treated as idle", TestUninitializedTripIsIdle),
     ("Ocean Fishing launches once during an active window with completed dungeon allocation", TestOceanFishingLaunchDuringWindow),
+    ("early Ocean Fishing launch remains pending through delayed actual boarding", TestEarlyOceanFishingLaunchBoardsAfterOldTimeout),
+    ("Ocean Fishing matching boarding at deadline wins over timeout", TestOceanFishingBoardingWinsAtDeadline),
+    ("Ocean Fishing timeout deadline enters recovery without relaunch", TestOceanFishingBoardingDeadlineRecovery),
+    ("unrelated duty does not count as Ocean Fishing boarding", TestUnrelatedDutyDoesNotCountAsFishingBoarding),
+    ("Ocean Fishing territory without duty entry still times out", TestOceanTerritoryWithoutDutyStillTimesOut),
     ("Ocean Fishing cutoff miss is recorded before schedule advances", TestOceanFishingMissedCutoff),
     ("reload recovery can be stopped independently of Resume eligibility", TestReloadRecoveryCanStop),
     ("recovery stop preserves unresolved fishing ownership", TestRecoveryStopPreservesFishingOwnership),
@@ -212,16 +235,359 @@ static void TestSynchronousCompletion()
     True(h.Configuration.RetainerHandoff.State != "RecoveryRequired", "synchronous completion is not treated as lost ownership");
 }
 
+static void TestAutoDutyPreparedForSingleRun()
+{
+    var h = new Harness(known: true, ready: true, seedCompletedRun: false);
+    h.AutoDuty.ConfiguredLoopCount = 8;
+    h.TickAll(); // queue run
+    h.TickAll(); // prepare mode and dispatch
+
+    Equal(1, h.AutoDuty.ModeWriteRequests, "selected Support mode is applied automatically");
+    Equal("Support", h.AutoDuty.DutyMode, "configured AutoDuty duty mode matches TT selection");
+    Equal(1, h.AutoDuty.RunRequests, "AutoDuty dispatched once");
+    Equal(1, h.AutoDuty.RunLoopCount, "dispatch explicitly requests exactly one loop");
+    Equal(1, h.AutoDuty.ConfiguredLoopCount, "AutoDuty Run applies single-loop count");
+    True(h.Dungeon.Current is { State: "AwaitingDuty" }, "run starts without manual AutoDuty setup");
+}
+
+static void TestAutoDutyModeWriteRetries()
+{
+    var h = new Harness(known: true, ready: true, seedCompletedRun: false);
+    h.AutoDuty.ModeWriteFailures = 1;
+    h.TickAll(); // queue run
+    h.TickAll(); // first mode write fails
+    Equal("PendingValidation", h.Dungeon.Current!.State, "mode failure remains prelaunch pending");
+    Equal(0, h.AutoDuty.RunRequests, "failed mode preparation never dispatches");
+    Equal(0, h.Configuration.CancelledDungeonRuns.Count, "mode failure does not create failed/cancelled run history");
+
+    h.TickAll();
+    Equal(1, h.AutoDuty.ModeWriteRequests, "poll interval prevents repeated immediate writes");
+    h.Clock.Advance(TimeSpan.FromSeconds(5));
+    h.TickAll();
+    Equal(2, h.AutoDuty.ModeWriteRequests, "mode preparation retries after wait");
+    Equal(1, h.AutoDuty.RunRequests, "dispatch resumes after mode write succeeds");
+    Equal("AwaitingDuty", h.Dungeon.Current!.State, "operation transitions to launched state");
+}
+
+static void TestPrelaunchProviderWaitResumes()
+{
+    var h = new Harness(known: true, ready: true, seedCompletedRun: false);
+    h.TickAll(); // queue run
+    h.Retainers.Known = false;
+    h.TickAll();
+    Equal("PendingValidation", h.Dungeon.Current!.State, "unknown provider state waits without failure");
+    Equal(0, h.AutoDuty.RunRequests, "unknown provider state blocks dispatch");
+    var firstReason = h.Dungeon.Current.Detail;
+    h.TickAll();
+    Equal(firstReason, h.Dungeon.Current!.Detail, "unchanged wait reason remains stable");
+    Equal(0, h.Configuration.CancelledDungeonRuns.Count, "provider wait creates no failed run history");
+
+    h.Retainers.Known = true;
+    h.Clock.Advance(TimeSpan.FromSeconds(5));
+    h.TickAll();
+    Equal(1, h.AutoDuty.RunRequests, "provider idle state automatically resumes dispatch");
+    Equal("AwaitingDuty", h.Dungeon.Current!.State, "pending run transitions after provider clears");
+}
+
 static void TestStopDuringVentureWait()
 {
     var h = new Harness(known: true, ready: false);
     h.Retainers.ClosestEligibleSeconds = 300;
     h.TickAll();
     Equal(0, h.Retainers.PassRequests, "near-complete venture waits without an early pass");
-    h.Handoff.RequestStop();
+    h.ManualStop.RequestStop();
     h.TickAll();
+    Equal("Stopped", h.Configuration.AutomationSession!.State, "manual Stop completes in one framework update");
     Equal(0, h.Retainers.PassRequests, "Stop prevents pass request");
     Equal(0, h.AutoDuty.RunRequests, "Stop prevents dungeon request");
+}
+
+static void TestManualStopCancelsRetainerImmediately()
+{
+    var h = new Harness(known: true, ready: true);
+    h.TickAll();
+    h.Retainers.Busy = true;
+    h.Retainers.Active = true;
+    h.TickAll();
+    Equal("RunningPass", h.Configuration.RetainerHandoff!.State, "TT owns active retainer pass");
+    h.Game.Name = "Retainer Alt";
+
+    h.ManualStop.RequestStop();
+    h.TickAll();
+
+    Equal("Stopped", h.Configuration.AutomationSession!.State, "parent session stopped immediately");
+    Equal("Stopped", h.Configuration.RetainerSession!.State, "retainer session stopped immediately");
+    Equal(null, h.Configuration.RetainerHandoff, "active handoff no longer owns TT");
+    Equal(1, h.Retainers.CancelRequests, "TT-owned AutoRetainer pass cancelled once");
+    Equal(0, h.Lifestream.ReturnRequests, "manual Stop never requests farming-character return");
+    True(h.Configuration.CancelledRetainerHandoffs.Single().State == "CancelledByUser", "cancelled handoff preserved as history");
+}
+
+static void TestManualStopClearsFishingRecovery()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    SeedFishingRecovery(h);
+    h.Configuration.OceanFishingOperation!.FishingCharacterContentId = h.Game.ContentId;
+    h.Configuration.OceanFishingOperation.FishingCharacterName = h.Game.Name;
+    h.Configuration.OceanFishingOperation.FishingCharacterWorld = h.Game.World;
+    h.Ocean.RecoverAfterReload();
+    h.Game.Name = "Different Character";
+
+    h.ManualStop.RequestStop();
+    h.TickAll();
+
+    Equal("Stopped", h.Configuration.AutomationSession!.State, "recovery parent stopped immediately");
+    Equal(null, h.Configuration.OceanFishingOperation, "fishing ownership cleared without safe-return acknowledgment");
+    True(h.Configuration.CancelledOceanFishingOperations.Single().State == "CancelledByUser", "fishing cancellation retained as history");
+    True(h.Configuration.HandledOceanFishingWindowsUtc!.Contains(new DateTimeOffset(2026, 10, 21, 8, 0, 0, TimeSpan.Zero)),
+        "ambiguous launched window remains handled");
+    Equal(0, h.Feesh.LaunchCalls, "Stop never replays voyage");
+}
+
+static void TestManualStopCancelsOwnedWahTools()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    h.Configuration.AutomationSession!.OceanFishingEnabled = true;
+    h.Configuration.AutomationSession.OceanFishingPreparationLeadMinutes = 15;
+    h.Clock.Advance(TimeSpan.FromMinutes(45));
+    h.Ocean.Tick();
+    h.Ocean.Tick();
+    Equal(1, h.Feesh.LaunchCalls, "one TT-owned WahTools launch issued");
+    Equal("AwaitingBoarding", h.Configuration.OceanFishingOperation!.State, "operation owns pending boarding");
+
+    h.ManualStop.RequestStop();
+    h.TickAll();
+
+    Equal(1, h.Feesh.LaunchCalls, "manual Stop never relaunches voyage");
+    Equal(1, h.Feesh.StopCalls, "manual Stop requests WahTools cancellation once");
+    Equal(null, h.Configuration.OceanFishingOperation, "fishing ownership cleared immediately");
+    True(h.Configuration.CancelledOceanFishingOperations.Single().State == "CancelledByUser", "cancelled voyage remains in audit history");
+    True(h.Configuration.HandledOceanFishingWindowsUtc.Contains(new DateTimeOffset(2026, 10, 21, 10, 0, 0, TimeSpan.Zero)),
+        "launched fishing window is retained as handled");
+}
+
+static void TestManualStopRecordsCancellationWarnings()
+{
+    var h = new Harness(known: true, ready: true);
+    h.TickAll();
+    h.Retainers.Busy = true;
+    h.Retainers.Active = true;
+    h.TickAll();
+    h.Retainers.CancelAccepted = false;
+    var credited = h.Configuration.FarmingPlan!.CreditedOperationIds.ToArray();
+    h.AutoDuty.Stopped = false;
+
+    h.ManualStop.RequestStop();
+    h.TickAll();
+
+    Equal("Stopped", h.Configuration.AutomationSession!.State, "provider cancellation failure does not hold TT stopped state");
+    True(h.Configuration.AutomationSession.Detail.Contains("AutoRetainer may still be running", StringComparison.Ordinal),
+        "provider cancellation failure is visible");
+    True(h.Configuration.AutomationSession.Detail.Contains("AutoDuty was not stopped", StringComparison.Ordinal),
+        "AutoDuty non-cancellation is explicit");
+    True(credited.SequenceEqual(h.Configuration.FarmingPlan!.CreditedOperationIds), "verified dungeon credits preserved");
+}
+
+static void TestManualStopCancelsPendingDungeon()
+{
+    var h = new Harness(known: true, ready: true, seedCompletedRun: false);
+    h.TickAll();
+    True(h.Dungeon.Current is { State: "PendingValidation" }, "plan has queued but not dispatched dungeon");
+
+    h.ManualStop.RequestStop();
+    h.TickAll();
+
+    Equal(0, h.AutoDuty.RunRequests, "pending dungeon never reaches AutoDuty");
+    Equal(null, h.Dungeon.Current, "pending run no longer blocks TT");
+    Equal("CancelledByUser", h.Configuration.CancelledDungeonRuns.Single().State, "pending run cancellation retained");
+    Equal("Stopped", h.Configuration.FarmingPlan!.State, "farming plan stopped immediately");
+}
+
+static void TestManualStopObservesLaunchedDungeon()
+{
+    var h = new Harness(known: true, ready: true, seedCompletedRun: false);
+    h.TickAll(); // queue
+    h.TickAll(); // dispatch
+    Equal(1, h.AutoDuty.RunRequests, "dungeon dispatched before Stop");
+    var operationId = h.Dungeon.Current!.OperationId;
+
+    h.ManualStop.RequestStop();
+    h.TickAll();
+
+    Equal(operationId, h.Dungeon.Current!.OperationId, "launched dungeon remains tracked after Stop");
+    Equal("AwaitingDuty", h.Dungeon.Current.State, "Stop does not overwrite observer state");
+    Equal(operationId, h.Configuration.FarmingPlan!.CurrentOperationId, "checklist retains active operation link");
+    Equal(1, h.AutoDuty.RunRequests, "Stop and later observations never dispatch another run");
+
+    h.Game.ContentFinderConditionId = 456;
+    h.Game.TerritoryType = 321;
+    h.Game.RaiseDutyStarted();
+    h.Dungeon.Tick();
+    h.Game.RaiseDutyCompleted();
+    h.Game.IsDutyStarted = false;
+    h.Game.ContentFinderConditionId = 0;
+    h.Game.TerritoryType = 100;
+    h.AutoDuty.Stopped = true;
+    h.Dungeon.Tick();
+    h.WeeklyAcquired = 150;
+    h.Dungeon.Tick(); // reward reconciliation
+    h.Farming.Tick(); // stopped scheduler credits verified completion only
+
+    Equal(1, h.Configuration.FarmingPlan.Periods.Single().CompletedRuns, "completed stopped dungeon credited once");
+    Equal(null, h.Configuration.FarmingPlan.CurrentOperationId, "observer link released after credit");
+    Equal(null, h.Configuration.FarmingPlan.RetainerCheckpointOperationId, "Stop prevents post-dungeon handoff");
+    Equal(1, h.AutoDuty.RunRequests, "stopped scheduler does not launch follow-up dungeon");
+}
+
+static void TestSamePeriodChecklistPreserved()
+{
+    var h = new Harness(known: true, ready: true, seedCompletedRun: false);
+    var checklist = h.Configuration.FarmingPlan!.Periods.Single();
+    checklist.AllocatedRuns = 3;
+    checklist.CompletedRuns = 2;
+    h.WeeklyAcquired = 850; // actual weekly remainder would now imply only one run
+
+    h.Farming.Tick(externalCharacterHandoffOwns: false, allowDispatch: false);
+
+    Equal(3, h.Configuration.FarmingPlan.Periods.Single().AllocatedRuns, "same-period target is stable despite changed live tome count");
+    Equal(2, h.Configuration.FarmingPlan.Periods.Single().CompletedRuns, "completed checklist count survives refresh");
+}
+
+static void TestPeriodRolloverCreatesChecklist()
+{
+    var h = new Harness(known: true, ready: true, seedCompletedRun: false);
+    h.Clock.Advance(TimeSpan.FromDays(2));
+    h.WeeklyAcquired = 100; // 16 runs remain; five daily periods remain at this point
+
+    h.Farming.Tick(externalCharacterHandoffOwns: false, allowDispatch: false);
+
+    var plan = h.Configuration.FarmingPlan!;
+    var current = plan.Periods.Single();
+    Equal(FarmingSchedulePolicy.GetPeriodStartUtc(h.Clock.UtcNow, plan.WeekStartUtc), current.StartUtc,
+        "old checklist replaced by current UTC period");
+    Equal(4, current.AllocatedRuns, "16 runs over four remaining daily periods gives target four");
+    Equal(0, current.CompletedRuns, "new period checklist begins at zero");
+}
+
+static void TestActiveRunRepairsChecklistPointer()
+{
+    var h = new Harness(known: true, ready: true, seedCompletedRun: false);
+    var plan = h.Configuration.FarmingPlan!;
+    var today = FarmingSchedulePolicy.GetPeriodStartUtc(h.Clock.UtcNow, plan.WeekStartUtc);
+    var yesterday = today.AddDays(-1);
+    var old = new FarmingPeriodRecord { StartUtc = yesterday, AllocatedRuns = 3, CompletedRuns = 3 };
+    var current = new FarmingPeriodRecord { StartUtc = today, AllocatedRuns = 3, CompletedRuns = 2,
+        CreditedOperationIds = ["run-a", "run-b"] };
+    plan.CurrentPeriodStartUtc = yesterday;
+    plan.Periods = [old, current];
+    plan.CurrentOperationId = "run-c";
+    h.Configuration.DungeonRun = new DungeonRunRecord
+    {
+        OperationId = "run-c", FarmingPlanId = plan.PlanId, FarmingPeriodStartUtc = today,
+        State = "RunningDuty", RewardOutcome = "Unknown", DungeonName = "Test Dungeon",
+    };
+
+    h.Farming.Tick(externalCharacterHandoffOwns: false, allowDispatch: false);
+
+    Equal(today, plan.CurrentPeriodStartUtc!.Value, "active run period becomes authoritative pointer");
+    Equal(1, plan.Periods.Count, "legacy period records collapse to one current checklist");
+    Equal(2, h.Farming.CurrentChecklist!.CompletedRuns, "current progress survives pointer repair");
+    Equal(3, h.Farming.CurrentChecklist.AllocatedRuns, "current target survives pointer repair");
+}
+
+static void TestLegacyFutureTargetRecalculated()
+{
+    var h = new Harness(known: true, ready: true, seedCompletedRun: false);
+    var plan = h.Configuration.FarmingPlan!;
+    var today = FarmingSchedulePolicy.GetPeriodStartUtc(h.Clock.UtcNow, plan.WeekStartUtc);
+    plan.CurrentPeriodStartUtc = today.AddDays(-1);
+    plan.Periods =
+    [
+        new FarmingPeriodRecord { StartUtc = today.AddDays(-1), AllocatedRuns = 3, CompletedRuns = 3 },
+        new FarmingPeriodRecord { StartUtc = today, AllocatedRuns = 1 },
+        new FarmingPeriodRecord { StartUtc = today.AddDays(1), AllocatedRuns = 2 },
+    ];
+
+    h.Farming.Tick(externalCharacterHandoffOwns: false, allowDispatch: false);
+
+    var expected = FarmingSchedulePolicy.CurrentPeriodTarget(16, today, plan.FinishDeadlineUtc);
+    Equal(today, plan.CurrentPeriodStartUtc!.Value, "current period replaces stale pointer");
+    Equal(1, plan.Periods.Count, "future allocations are removed from checklist state");
+    Equal(expected, plan.Periods.Single().AllocatedRuns, "unused legacy future allocation is recalculated from current weekly tomes");
+}
+
+static void TestManualStopStillGatesRestartOnProviderState()
+{
+    var h = new Harness(known: true, ready: true);
+    h.TickAll();
+    var issuedPasses = h.Retainers.PassRequests;
+    h.ManualStop.RequestStop();
+    h.TickAll();
+    h.Configuration.FarmingPlan = null;
+    h.Configuration.DungeonRun = null;
+    h.Retainers.Busy = true;
+    h.Retainers.Active = true;
+    h.Automation.StartOrResume(123, "Farm Main", "Test World", true, 5,
+        false, 15, "CurrentCharacter", 0, string.Empty, string.Empty, null);
+
+    h.Handoff.Tick();
+
+    Equal(issuedPasses, h.Retainers.PassRequests, "new session does not dispatch while AutoRetainer remains active");
+    Equal("Active", h.Configuration.AutomationSession!.State, "temporary busy provider does not force recovery");
+    True(h.Configuration.AutomationSession.Detail.Contains("Waiting before provider work", StringComparison.Ordinal),
+        "UI-visible session detail explains the wait");
+    Equal(issuedPasses, h.Retainers.PassRequests, "active provider receives no duplicate request");
+    h.Retainers.Busy = false;
+    h.Retainers.Active = false;
+    h.Clock.Advance(TimeSpan.FromSeconds(5));
+    h.Handoff.Tick();
+    Equal(issuedPasses + 1, h.Retainers.PassRequests, "provider work continues automatically when idle");
+    True(!h.Configuration.AutomationSession.Detail.Contains("Waiting before provider work", StringComparison.Ordinal),
+        "UI-visible wait clears after providers become idle");
+}
+
+static void TestManualStopReloadDoesNotReplay()
+{
+    var original = new Harness(known: true, ready: false, seedCompletedRun: false);
+    original.Configuration.RetainerHandoff = new RetainerHandoffRecord
+    {
+        HandoffId = "stop-retainer", SessionId = "session", State = "ManualStopPending",
+        RecoveryKind = "ManualStop", LaunchIntentUtc = original.Clock.UtcNow,
+    };
+    original.Configuration.OceanFishingOperation = new OceanFishingOperationRecord
+    {
+        OperationId = "stop-fishing", State = "ManualStopPending", RecoveryKind = "ManualStop",
+        LaunchIntentUtc = original.Clock.UtcNow, WindowStartUtc = new DateTimeOffset(2026, 10, 21, 8, 0, 0, TimeSpan.Zero),
+    };
+    original.Configuration.DungeonRun = new DungeonRunRecord
+    {
+        OperationId = "stop-dungeon", State = "ManualStopPending", FarmingPlanId = "plan",
+    };
+    original.Configuration.AutomationSession!.State = "StopRequested";
+    original.Configuration.AutomationSession.StopRequested = true;
+    original.Configuration.AutomationSession.RecoveryKind = "ManualStop";
+    original.Configuration.RetainerSession!.State = "StopRequested";
+    original.Configuration.RetainerSession.StopRequested = true;
+    original.Configuration.RetainerSession.RecoveryKind = "ManualStop";
+    original.Configuration.FarmingPlan!.RecoveryKind = "ManualStop";
+    original.PersistSnapshot();
+
+    var restored = JsonSerializer.Deserialize<Configuration>(original.Snapshot())!;
+    var reloaded = new Harness(known: true, ready: false, restored, seedCompletedRun: false);
+    reloaded.Automation.RecoverAfterReload();
+    reloaded.Farming.RecoverAfterReload();
+    reloaded.Handoff.RecoverAfterReload();
+    reloaded.Ocean.RecoverAfterReload();
+
+    Equal("Stopped", restored.AutomationSession!.State, "persisted parent Stop finalizes after reload");
+    Equal("Stopped", restored.RetainerSession!.State, "persisted retainer Stop finalizes after reload");
+    Equal("Stopped", restored.FarmingPlan!.State, "persisted plan Stop finalizes after reload");
+    Equal(null, restored.RetainerHandoff, "retainer ownership cleared after reload");
+    Equal(null, restored.OceanFishingOperation, "fishing ownership cleared after reload");
+    Equal(null, restored.DungeonRun, "dungeon ownership cleared after reload");
+    Equal(0, reloaded.Retainers.CancelRequests, "reload recovery never replays cancellation IPC");
+    Equal(0, reloaded.Feesh.StopCalls, "reload recovery never replays WahTools Stop");
+    Equal(0, reloaded.Lifestream.AbortRequests, "reload recovery never replays Lifestream Abort");
 }
 
 static void TestReturnVerificationTimeout()
@@ -357,6 +723,118 @@ static void TestOceanFishingLaunchDuringWindow()
     Equal("AwaitingBoarding", ocean.Current!.State, "accepted launch waits for observed boarding");
     Equal("LaunchReady", ocean.Admission!.Code, "cached admission reports passed launch preflight");
 }
+
+static void TestEarlyOceanFishingLaunchBoardsAfterOldTimeout()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    var windowStart = new DateTimeOffset(2026, 10, 21, 10, 0, 0, TimeSpan.Zero);
+    h.Clock.Advance(TimeSpan.FromMinutes(40).Add(TimeSpan.FromSeconds(20)));
+    SeedAwaitingBoarding(h, windowStart, h.Clock.UtcNow);
+    var feesh = new FakeFeesh(() => CreateIdleFeeshStatus(h.Clock.UtcNow));
+    using var ocean = CreateAwaitingBoardingController(h, feesh);
+
+    h.Clock.Advance(TimeSpan.FromMinutes(30)); // 10:10:20, old launch-relative timeout
+    ocean.Tick();
+    Equal("AwaitingBoarding", ocean.Current!.State, "early launch gets registration-end boarding grace");
+
+    h.Clock.Advance(TimeSpan.FromMinutes(5).Add(TimeSpan.FromSeconds(3))); // 10:15:23, observed live boarding
+    h.Game.TerritoryType = 900;
+    h.Game.IsDutyStarted = true;
+    h.Game.IsBoundByDuty = true;
+    ocean.Tick();
+
+    Equal("VoyageRunning", ocean.Current!.State, "actual Ocean Fishing duty is accepted after old timeout boundary");
+    Equal(0, feesh.LaunchCalls, "observation does not dispatch another voyage");
+}
+
+static void TestOceanFishingBoardingWinsAtDeadline()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    var windowStart = new DateTimeOffset(2026, 10, 21, 10, 0, 0, TimeSpan.Zero);
+    h.Clock.Advance(TimeSpan.FromMinutes(40).Add(TimeSpan.FromSeconds(20)));
+    SeedAwaitingBoarding(h, windowStart, h.Clock.UtcNow);
+    var feesh = new FakeFeesh(() => CreateIdleFeeshStatus(h.Clock.UtcNow));
+    using var ocean = CreateAwaitingBoardingController(h, feesh);
+    h.Clock.Advance(TimeSpan.FromMinutes(39).Add(TimeSpan.FromSeconds(40))); // 10:20:00 deadline
+    h.Game.TerritoryType = 900;
+    h.Game.IsBoundByDuty = true;
+
+    ocean.Tick();
+
+    Equal("VoyageRunning", ocean.Current!.State, "matching boarding observed on deadline tick takes precedence");
+    Equal(0, feesh.LaunchCalls, "deadline observation never dispatches again");
+}
+
+static void TestOceanFishingBoardingDeadlineRecovery()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    var windowStart = new DateTimeOffset(2026, 10, 21, 10, 0, 0, TimeSpan.Zero);
+    h.Clock.Advance(TimeSpan.FromMinutes(40).Add(TimeSpan.FromSeconds(20)));
+    SeedAwaitingBoarding(h, windowStart, h.Clock.UtcNow);
+    var feesh = new FakeFeesh(() => CreateIdleFeeshStatus(h.Clock.UtcNow));
+    using var ocean = CreateAwaitingBoardingController(h, feesh);
+    h.Clock.Advance(TimeSpan.FromMinutes(39).Add(TimeSpan.FromSeconds(39)));
+    ocean.Tick();
+    Equal("AwaitingBoarding", ocean.Current!.State, "no timeout just before 10:20 deadline");
+    h.Clock.Advance(TimeSpan.FromSeconds(1));
+
+    ocean.Tick();
+    Equal("RecoveryRequired", ocean.Current!.State, "no boarding by deadline requires explicit recovery");
+    True(ocean.Current.Detail.Contains("2026-10-21T10:20:00", StringComparison.Ordinal), "timeout records exact deadline");
+    Equal(0, feesh.LaunchCalls, "deadline failure never retries launch");
+    ocean.Tick();
+    Equal(0, feesh.LaunchCalls, "recovery ticks never retry launch");
+}
+
+static void TestUnrelatedDutyDoesNotCountAsFishingBoarding()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    var windowStart = new DateTimeOffset(2026, 10, 21, 10, 0, 0, TimeSpan.Zero);
+    h.Clock.Advance(TimeSpan.FromMinutes(40).Add(TimeSpan.FromSeconds(20)));
+    SeedAwaitingBoarding(h, windowStart, h.Clock.UtcNow);
+    var feesh = new FakeFeesh(() => CreateIdleFeeshStatus(h.Clock.UtcNow));
+    using var ocean = CreateAwaitingBoardingController(h, feesh);
+    h.Clock.Advance(TimeSpan.FromMinutes(39).Add(TimeSpan.FromSeconds(40)));
+    h.Game.IsDutyStarted = true;
+    h.Game.IsBoundByDuty = true;
+
+    ocean.Tick();
+
+    Equal("RecoveryRequired", ocean.Current!.State, "unrelated territory duty cannot establish fishing boarding");
+    Equal(0, feesh.LaunchCalls, "unrelated duty does not trigger a relaunch");
+}
+
+static void TestOceanTerritoryWithoutDutyStillTimesOut()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    var windowStart = new DateTimeOffset(2026, 10, 21, 10, 0, 0, TimeSpan.Zero);
+    h.Clock.Advance(TimeSpan.FromMinutes(40).Add(TimeSpan.FromSeconds(20)));
+    SeedAwaitingBoarding(h, windowStart, h.Clock.UtcNow);
+    var feesh = new FakeFeesh(() => CreateIdleFeeshStatus(h.Clock.UtcNow));
+    using var ocean = CreateAwaitingBoardingController(h, feesh);
+    h.Clock.Advance(TimeSpan.FromMinutes(39).Add(TimeSpan.FromSeconds(40)));
+    h.Game.TerritoryType = 900;
+
+    ocean.Tick();
+
+    Equal("RecoveryRequired", ocean.Current!.State, "territory entry alone cannot suppress boarding timeout");
+    Equal(0, feesh.LaunchCalls, "territory-only observation never retries launch");
+}
+
+static void SeedAwaitingBoarding(Harness h, DateTimeOffset windowStart, DateTimeOffset launchIntentUtc)
+{
+    h.Configuration.OceanFishingOperation = new OceanFishingOperationRecord
+    {
+        OperationId = "awaiting-boarding", SessionId = "session", State = "AwaitingBoarding",
+        WindowStartUtc = windowStart, LaunchIntentUtc = launchIntentUtc, PhaseChangedUtc = launchIntentUtc,
+        FarmingCharacterContentId = 123, FarmingCharacterName = "Farm Main", FarmingCharacterWorld = "Test World",
+        FishingCharacterContentId = 123, FishingCharacterName = "Farm Main", FishingCharacterWorld = "Test World",
+    };
+}
+
+static OceanFishingHandoffController CreateAwaitingBoardingController(Harness h, FakeFeesh feesh) =>
+    new(h.Configuration, () => { }, h.Game, h.Retainers, h.Lifestream, feesh,
+        () => false, () => true, new NullWorkflowLog(), h.Clock);
 
 static void TestOceanFishingMissedCutoff()
 {
@@ -498,6 +976,107 @@ static void TestRecoveryStopPreservesFishingOwnership()
     Equal("RecoveryRequired", h.Configuration.OceanFishingOperation!.State, "fishing operation is preserved");
 }
 
+static void TestFishingRecoveryAcknowledgedSafely()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    SeedFishingRecovery(h);
+    var feesh = new FakeFeesh(() => CreateIdleFeeshStatus(h.Clock.UtcNow));
+    using var controller = CreateFishingRecoveryController(h, feesh);
+
+    controller.Tick();
+    True(controller.CanAcknowledgeRecovery, "safe farming character and idle providers enable acknowledgment");
+    True(controller.RequestRecoveryAcknowledgement(), "user request queues acknowledgment");
+    Equal("RecoveryRequired", h.Configuration.OceanFishingOperation!.State, "request alone does not mutate recovery state");
+    controller.Tick();
+
+    Equal("RecoveryAcknowledged", h.Configuration.OceanFishingOperation!.State, "recovery is acknowledged on framework tick");
+    True(h.Configuration.HandledOceanFishingWindowsUtc!.Contains(h.Configuration.OceanFishingOperation.WindowStartUtc),
+        "ambiguous window remains handled");
+    Equal("Stopped", h.Configuration.AutomationSession!.State, "linked parent automation stopped");
+    Equal("Stopped", h.Configuration.FarmingPlan!.State, "linked farming plan stopped");
+    Equal("Stopped", h.Configuration.RetainerSession!.State, "linked retainer session stopped");
+    Equal(0, feesh.LaunchCalls, "acknowledgment never launches a voyage");
+    Equal("RecoveryAcknowledged", controller.Admission!.Code, "stale LaunchReady admission replaced");
+}
+
+static void TestFishingRecoveryAcknowledgementRevalidates()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    SeedFishingRecovery(h);
+    var feesh = new FakeFeesh(() => CreateIdleFeeshStatus(h.Clock.UtcNow));
+    using var controller = CreateFishingRecoveryController(h, feesh);
+
+    controller.Tick();
+    True(controller.CanAcknowledgeRecovery, "initial safe readiness cached");
+    h.Game.Name = "Different Character";
+    True(controller.RequestRecoveryAcknowledgement(), "acknowledgment queued from cached-ready UI");
+    controller.Tick();
+    Equal("RecoveryRequired", h.Configuration.OceanFishingOperation!.State, "character change blocks acknowledgment");
+    True(controller.RecoveryAcknowledgementStatus.Contains("Return to the farming character", StringComparison.Ordinal),
+        "character blocker is visible");
+
+    h.Game.Name = "Farm Main";
+    h.Clock.Advance(TimeSpan.FromSeconds(1));
+    controller.Tick();
+    True(controller.CanAcknowledgeRecovery, "readiness returns after farming character verified");
+    h.Game.IsBoundByDuty = true;
+    True(controller.RequestRecoveryAcknowledgement(), "second request queued");
+    controller.Tick();
+    Equal("RecoveryRequired", h.Configuration.OceanFishingOperation!.State, "active duty blocks acknowledgment");
+    True(controller.RecoveryAcknowledgementStatus.Contains("active duty", StringComparison.Ordinal),
+        "duty blocker is visible");
+    Equal(0, feesh.LaunchCalls, "revalidation never relaunches voyage");
+}
+
+static void TestFishingRecoveryAcknowledgementSaveFailure()
+{
+    var h = new Harness(known: true, ready: false, seedCompletedRun: false);
+    SeedFishingRecovery(h);
+    var failSave = false;
+    var feesh = new FakeFeesh(() => CreateIdleFeeshStatus(h.Clock.UtcNow));
+    using var controller = CreateFishingRecoveryController(h, feesh, () =>
+    {
+        if (failSave)
+            throw new IOException("Injected recovery acknowledgment persistence failure.");
+    });
+    controller.Tick();
+    True(controller.RequestRecoveryAcknowledgement(), "safe request queued");
+    failSave = true;
+    controller.Tick();
+
+    Equal("RecoveryRequired", h.Configuration.OceanFishingOperation!.State, "failed persistence keeps ownership unresolved");
+    Equal("PersistenceFailure", h.Configuration.OceanFishingOperation.RecoveryKind, "persistence failure is explicit");
+    True(controller.NeedsRecovery, "recovery remains visible");
+    Equal(0, feesh.LaunchCalls, "save failure never launches voyage");
+}
+
+static void SeedFishingRecovery(Harness h)
+{
+    h.Configuration.AutomationSession = new AutomationSessionRecord
+    {
+        SessionId = "session", State = "RecoveryRequired", RecoveryKind = "OceanFishing",
+        FarmingPlanId = "plan", FarmingCharacterContentId = 123,
+        FarmingCharacterName = "Farm Main", FarmingCharacterWorld = "Test World",
+    };
+    h.Configuration.FarmingPlan!.State = "Active";
+    h.Configuration.FarmingPlan.StopRequested = false;
+    h.Configuration.RetainerSession!.State = "Active";
+    h.Configuration.RetainerSession.StopRequested = false;
+    h.Configuration.OceanFishingOperation = new OceanFishingOperationRecord
+    {
+        OperationId = "ambiguous-op", SessionId = "session", State = "RecoveryRequired",
+        RecoveryKind = "AmbiguousProviderOutcome", WindowStartUtc = h.Clock.UtcNow.AddHours(-1),
+        LaunchIntentUtc = h.Clock.UtcNow.AddHours(-1), FarmingCharacterContentId = 123,
+        FarmingCharacterName = "Farm Main", FarmingCharacterWorld = "Test World",
+        FishingCharacterContentId = 456, FishingCharacterName = "Fishing Alt", FishingCharacterWorld = "Test World",
+        Detail = "Ambiguous launch; no replay.",
+    };
+}
+
+static OceanFishingHandoffController CreateFishingRecoveryController(Harness h, FakeFeesh feesh, Action? save = null) =>
+    new(h.Configuration, save ?? (() => { }), h.Game, h.Retainers, h.Lifestream, feesh,
+        () => false, () => true, new NullWorkflowLog(), h.Clock, () => false);
+
 static void TestAcknowledgedRecoveryAllowsNewPlan()
 {
     var h = new Harness(known: true, ready: false, seedCompletedRun: false);
@@ -563,6 +1142,14 @@ static void Equal<T>(T expected, T actual, string message)
 
 sealed class Harness
 {
+    private static WahToolsFeeshStatus CreateIdleStatus(DateTimeOffset now) => new(
+        true, now, "WahTools Feesh idle",
+        WahToolsFeeshStatus.NormalizeTripRunning(false, null), false, false, false, false, false, false,
+        "Idle", "Trip not initialized", "Idle", 1)
+    {
+        TripInitialized = false,
+    };
+
     public readonly TestClock Clock = new(new DateTimeOffset(2026, 10, 21, 9, 0, 0, TimeSpan.Zero));
     public readonly Configuration Configuration;
     public readonly FakeGame Game = new();
@@ -573,6 +1160,9 @@ sealed class Harness
     public readonly FarmingPlanController Farming;
     public readonly RetainerHandoffController Handoff;
     public readonly AutomationSessionController Automation;
+    public readonly FakeFeesh Feesh;
+    public readonly OceanFishingHandoffController Ocean;
+    public readonly ManualStopController ManualStop;
     public bool FailCheckpointClearSave { get; set; }
     public bool FailResumeSave { get; set; }
     public int WeeklyAcquired { get; set; } = 100;
@@ -586,6 +1176,7 @@ sealed class Harness
         Configuration = restoredConfiguration ?? new Configuration { MonitorRetainerVentures = true };
         Retainers = new FakeRetainers { Known = known, Ready = ready, Clock = Clock };
         Lifestream = new FakeLifestream(Game);
+        Feesh = new FakeFeesh(() => CreateIdleStatus(Clock.UtcNow));
         var log = new NullWorkflowLog();
         Automation = new AutomationSessionController(Configuration, Save, log, Clock);
         void Save()
@@ -614,6 +1205,10 @@ sealed class Harness
             Dungeon, Farming, () => Retainers.ReadReadiness(123), () => Retainers.ReadReadiness(123),
             () => true, log, Clock);
         Handoff.Subscribe();
+        Ocean = new OceanFishingHandoffController(Configuration, Save, Game, Retainers, Lifestream, Feesh,
+            () => Dungeon.Current is not null, () => AutoDuty.Stopped, log, Clock, () => Handoff.OwnsActivity);
+        ManualStop = new ManualStopController(Configuration, Save, Automation, Farming, Dungeon, Handoff, Ocean,
+            () => AutoDuty.Stopped, log, Clock);
 
         if (Configuration.FarmingPlan is null)
         {
@@ -666,6 +1261,8 @@ sealed class Harness
 
     public void TickAll()
     {
+        if (ManualStop.Tick())
+            return;
         Farming.Tick(Handoff.OwnsActivity);
         Handoff.Tick();
         Dungeon.Tick();
@@ -712,16 +1309,41 @@ sealed class FakeAutoDuty : IAutoDutyClient
 {
     public int RunRequests { get; private set; }
     public bool Stopped { get; set; } = true;
+    public string DutyMode { get; set; } = "Trust";
+    public int ConfiguredLoopCount { get; set; } = 5;
+    public int RunLoopCount { get; private set; }
+    public int ModeWriteRequests { get; private set; }
+    public int ModeWriteFailures { get; set; }
+    public bool IgnoreModeWrites { get; set; }
     public bool IsStopped() => Stopped;
     public string GetConfig(string name) => name switch
     {
         "Meta.AutoDutyModeEnum" => "Looping",
-        "Meta.LoopTimes" => "1",
-        "Meta.DutyModeEnum" => "Support",
+        "Meta.LoopTimes" => ConfiguredLoopCount.ToString(),
+        "Meta.DutyModeEnum" => DutyMode,
         _ => string.Empty,
     };
+    public void SetConfig(string name, string value)
+    {
+        if (name != "Meta.DutyModeEnum")
+            throw new InvalidOperationException($"Unexpected AutoDuty config write: {name}");
+        ModeWriteRequests++;
+        if (ModeWriteFailures > 0)
+        {
+            ModeWriteFailures--;
+            throw new IOException("injected mode write failure");
+        }
+        if (!IgnoreModeWrites)
+            DutyMode = value;
+    }
     public bool ContentHasPath(uint territoryId) => true;
-    public void Run(uint territoryId, bool bareMode) { RunRequests++; Stopped = false; }
+    public void Run(uint territoryId, int loops, bool bareMode)
+    {
+        RunRequests++;
+        RunLoopCount = loops;
+        ConfiguredLoopCount = loops;
+        Stopped = false;
+    }
 }
 
 sealed class FakeRetainers : IRetainerProvider
@@ -734,6 +1356,8 @@ sealed class FakeRetainers : IRetainerProvider
     public long? ClosestEligibleSeconds { get; set; }
     public bool FinishSynchronously { get; set; }
     public int PassRequests { get; private set; }
+    public int CancelRequests { get; private set; }
+    public bool CancelAccepted { get; set; } = true;
     public event Action? SinglePassFinished;
     public bool TryGetProviderState(out bool busy, out bool multiModeActive)
     {
@@ -754,13 +1378,28 @@ sealed class FakeRetainers : IRetainerProvider
         Active = !FinishSynchronously;
         if (FinishSynchronously) SinglePassFinished?.Invoke();
     }
+    public bool TryCancelOwnedPass(out string detail)
+    {
+        CancelRequests++;
+        if (CancelAccepted)
+        {
+            Busy = false;
+            Active = false;
+            detail = "cancelled";
+            return true;
+        }
+        detail = "injected cancellation failure";
+        return false;
+    }
     public void FinishPass() => SinglePassFinished?.Invoke();
 }
 
 sealed class FakeLifestream(FakeGame game) : ILifestreamProvider
 {
     public int ReturnRequests { get; private set; }
-    public bool TryGetBusy(out bool busy) { busy = false; return true; }
+    public int AbortRequests { get; private set; }
+    public bool Busy { get; set; }
+    public bool TryGetBusy(out bool busy) { busy = Busy; return true; }
     public bool TryChangeCharacter(string name, string world, out string result)
     {
         ReturnRequests++;
@@ -769,17 +1408,31 @@ sealed class FakeLifestream(FakeGame game) : ILifestreamProvider
         result = "Success";
         return true;
     }
+    public bool TryAbortOwnedRequest(out string result)
+    {
+        AbortRequests++;
+        Busy = false;
+        result = "aborted";
+        return true;
+    }
 }
 
 sealed class FakeFeesh(Func<WahToolsFeeshStatus> readStatus) : IWahToolsFeeshClient
 {
     public bool IsAvailable => true;
     public int LaunchCalls { get; private set; }
+    public int StopCalls { get; private set; }
     public WahToolsFeeshStatus ReadStatus() => readStatus();
     public FeeshRequestResult RequestSingleVoyage(out string detail)
     {
         LaunchCalls++;
         detail = "Accepted";
+        return FeeshRequestResult.Accepted;
+    }
+    public FeeshRequestResult Stop(out string detail)
+    {
+        StopCalls++;
+        detail = "Stopped";
         return FeeshRequestResult.Accepted;
     }
 }
