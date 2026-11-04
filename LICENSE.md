@@ -1,3 +1,13 @@
+Copyright (c) 2026 baanderson40.
+
+Original project code and content are licensed under the GNU Affero General
+Public License v3.0 or later (SPDX-License-Identifier: AGPL-3.0-or-later).
+Third-party code and dependencies retain their respective licenses and notices.
+
+The full, unmodified license text follows.
+
+------------------------------------------------------------------------
+
                     GNU AFFERO GENERAL PUBLIC LICENSE
                        Version 3, 19 November 2007
 
